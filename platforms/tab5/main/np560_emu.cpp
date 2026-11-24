@@ -102,18 +102,24 @@ static void emulator_task(void *arg)
         uint64_t worst = 0, worst_pc = 0;
         for (int i = 0; i < 10000; i++) {
             loop_insns++;
-            uint64_t t0i = esp_timer_get_time();
+            /* worst-insn 诊断降采样：逐指令 2 次 esp_timer_get_time()
+             * 在引导期累计上亿次调用（占 CPU 时间可观）。改为每 256
+             * 条指令取一次 256 指令块的平均耗时，保留热点定位能力。 */
+            bool t_sample = (i & 255) == 0;
+            uint64_t t0i = t_sample ? esp_timer_get_time() : 0;
             dmcu_exec_step(s_bus, &s_cpu);
-            uint64_t di = esp_timer_get_time() - t0i;
-            if (di > worst) {
-                worst = di;
-                worst_pc = s_cpu.pc;
+            if (t_sample) {
+                uint64_t di = esp_timer_get_time() - t0i;
+                if (di > worst) {
+                    worst = di;
+                    worst_pc = s_cpu.pc;
+                }
             }
             if (s_cpu.halted) {
                 break;
             }
         }
-        ESP_LOGI(TAG, "burst: %llu insns, exec %lluus, worst insn %lluus "
+        ESP_LOGI(TAG, "burst: %llu insns, exec %lluus, worst 256blk %lluus "
                  "@%02x:%04x",
                  (unsigned long long)loop_insns,
                  (unsigned long long)(esp_timer_get_time() - t_exec0),
@@ -183,12 +189,14 @@ static void emulator_task(void *arg)
                 Np560NandFileMedium *nf =
                     (Np560NandFileMedium *)s_periph.nand.medium.user;
                 ESP_LOGI(TAG,
-                         "nand: reads=%u prog=%u erase=%u dirty=%u flushed=%u pf=%u rf=%u",
+                         "nand: reads=%u prog=%u erase=%u dirty=%u flushed=%u pf=%u rf=%u op=%u oh=%u",
                          (unsigned)nf->stat_reads, (unsigned)nf->stat_programs,
                          (unsigned)nf->stat_erases, (unsigned)nf->stat_dirty,
                          (unsigned)nf->stat_flushed,
                          (unsigned)nf->stat_prefetch_fail,
-                         (unsigned)nf->stat_read_fails);
+                         (unsigned)nf->stat_read_fails,
+                         (unsigned)nf->stat_oob_prefetch,
+                         (unsigned)nf->stat_oob_hits);
             }
             /* 诊断：SFR/MMIO 写事件全列表（低频关键写不被热点淹没）
              * + 读热点 top4。SFR reg 原样、MMIO 前缀 M（physical>>1）。 */

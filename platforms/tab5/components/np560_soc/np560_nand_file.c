@@ -135,6 +135,8 @@ static bool file_write_raw(void *user, uint32_t page, const uint8_t *bytes)
             NP560_NAND_PAGE_OOB) {
         return false;
     }
+    /* 文件内容已变：OOB 块缓存里对应块的基线过期，令其失效。 */
+    m->oob_prefetch_block = 0xffffffffu;
     return true;
 }
 
@@ -541,17 +543,53 @@ static bool file_read_oob(void *user, uint32_t page, uint8_t *out)
     }
     {
         FILE *f = (FILE *)m->file;
-        long offset = file_oob_offset(m, page);
+        uint32_t block = page / NP560_NAND_PAGES_PER_BLOCK;
+        uint32_t in_block = page % NP560_NAND_PAGES_PER_BLOCK;
+        uint8_t *oob_buf = (uint8_t *)m->oob_block_buf;
 
-        io_trace('o', page);
-        ok = f && fseek(f, offset, SEEK_SET) == 0 &&
-             fread(out, 1, NP560_NAND_PAGE_OOB, f) == NP560_NAND_PAGE_OOB;
-        if (!ok) {
-            NF_FAIL_LOG("oobfile", page);
+        /* OOB 块预取：块内 64 页 OOB 在文件里连续（4KB）。首次访问某块
+         * 一次 fread 读整块 OOB，之后块内其余页从 RAM 拷贝。FTL 扫描按
+         * 块顺序进行，命中率接近 100%——TF 卡随机读次数除以 64。 */
+        if (oob_buf && m->oob_prefetch_block == block) {
+            memcpy(out, oob_buf + (size_t)in_block * NP560_NAND_PAGE_OOB,
+                   NP560_NAND_PAGE_OOB);
+            m->stat_oob_hits++;
+            xSemaphoreGive((SemaphoreHandle_t)m->lock);
+            m->stat_reads++;
+            return true;
         }
-        xSemaphoreGive((SemaphoreHandle_t)m->lock);
-        m->stat_reads++;
-        return ok;
+        if (oob_buf) {
+            long block_off = file_oob_offset(m, block * NP560_NAND_PAGES_PER_BLOCK);
+            size_t block_bytes = (size_t)NP560_NAND_PAGES_PER_BLOCK *
+                                 NP560_NAND_PAGE_OOB;
+            io_trace('O', block * NP560_NAND_PAGES_PER_BLOCK);
+            ok = f && fseek(f, block_off, SEEK_SET) == 0 &&
+                 fread(oob_buf, 1, block_bytes, f) == block_bytes;
+            if (ok) {
+                m->oob_prefetch_block = block;
+                m->stat_oob_prefetch++;
+                memcpy(out, oob_buf + (size_t)in_block * NP560_NAND_PAGE_OOB,
+                       NP560_NAND_PAGE_OOB);
+                xSemaphoreGive((SemaphoreHandle_t)m->lock);
+                m->stat_reads++;
+                return true;
+            }
+            m->stat_prefetch_fail++;
+        }
+        /* 预取失败（或 host 无缓存）：退化为单页读。 */
+        {
+            long offset = file_oob_offset(m, page);
+
+            io_trace('o', page);
+            ok = f && fseek(f, offset, SEEK_SET) == 0 &&
+                 fread(out, 1, NP560_NAND_PAGE_OOB, f) == NP560_NAND_PAGE_OOB;
+            if (!ok) {
+                NF_FAIL_LOG("oobfile", page);
+            }
+            xSemaphoreGive((SemaphoreHandle_t)m->lock);
+            m->stat_reads++;
+            return ok;
+        }
     }
 #else
     FILE *f = (FILE *)m->file;
@@ -603,13 +641,19 @@ bool np560_nand_file_medium_open(Np560NandFileMedium *m, const char *path)
     m->block_buf = heap_caps_malloc(
         (size_t)NP560_NAND_PAGES_PER_BLOCK * NP560_NAND_PAGE_TOTAL,
         MALLOC_CAP_SPIRAM);
-    if (!m->slots || !m->erased_bitmap || !m->prog_bitmap || !m->block_buf) {
+    m->oob_block_buf = heap_caps_malloc(
+        (size_t)NP560_NAND_PAGES_PER_BLOCK * NP560_NAND_PAGE_OOB,
+        MALLOC_CAP_SPIRAM);
+    if (!m->slots || !m->erased_bitmap || !m->prog_bitmap || !m->block_buf ||
+        !m->oob_block_buf) {
         free(m->slots);
         m->slots = NULL;
         free(m->prog_bitmap);
         m->prog_bitmap = NULL;
         free(m->block_buf);
         m->block_buf = NULL;
+        free(m->oob_block_buf);
+        m->oob_block_buf = NULL;
         fclose(f);
         m->file = NULL;
         return false;
@@ -617,6 +661,7 @@ bool np560_nand_file_medium_open(Np560NandFileMedium *m, const char *path)
     memset(m->slots, 0, sizeof(Np560NandWbSlot) * NP560_WB_SLOTS);
     memset(m->erased_bitmap, 0, NP560_ERASED_BITMAP_BYTES);
     memset(m->prog_bitmap, 0, NP560_PROG_BITMAP_BYTES);
+    m->oob_prefetch_block = 0xffffffffu;
     m->lock = (void *)xSemaphoreCreateMutex();
     m->flush_quit = false;
     if (xTaskCreate(wb_flush_task, "nand_wb", 3072, m, 2,
@@ -673,6 +718,8 @@ void np560_nand_file_medium_close(Np560NandFileMedium *m)
     m->prog_bitmap = NULL;
     free(m->block_buf);
     m->block_buf = NULL;
+    free(m->oob_block_buf);
+    m->oob_block_buf = NULL;
 #else
     if (m->file) {
         fclose((FILE *)m->file);

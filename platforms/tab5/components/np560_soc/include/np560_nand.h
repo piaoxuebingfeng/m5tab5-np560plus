@@ -113,6 +113,14 @@ typedef struct Np560NandFileMedium {
     void *lock;             /* SemaphoreHandle_t（ESP）/ NULL（host） */
     volatile bool flush_quit;
     void *flush_task;
+    /* OOB 块预取缓存（ESP_PLATFORM）：FTL 引导扫描 95% 只读 OOB，
+     * 且按块顺序。OOB 平面内一块的 64 页（64×64B=4KB）物理连续，
+     * 一次 fread 整块即可让块内后续 63 次读变成纯 RAM 拷贝——把
+     * ~14.7 万次 TF 卡随机读压到 ~2300 次块读（引导提速主路径）。 */
+    void *oob_block_buf;         /* 一块 OOB：64×64B = 4KB（PSRAM） */
+    uint32_t oob_prefetch_block; /* 已缓存块号，0xffffffff = 无效 */
+    uint32_t stat_oob_prefetch;  /* 实际块预取次数 */
+    uint32_t stat_oob_hits;      /* 块缓存命中次数 */
     /* 诊断统计（页单位）。 */
     uint32_t stat_reads;
     uint32_t stat_programs;
