@@ -318,9 +318,6 @@ static void smoke_test()
 
 void np560_emu_start()
 {
-    if (!alloc_framebuffers()) {
-        return;
-    }
     s_bus = np560_bus_create();
     cpu_reset(s_bus);
     /* 内存微基准：区分"PSRAM 慢"与"解释器逻辑慢"（bus 空间总是 16MB；
@@ -356,6 +353,11 @@ void np560_emu_start()
         if (firmware_ok) {
             np560_sd_attach_nand(&s_periph.nand);
         }
+    }
+    /* 放大 canvas(1.4MB) 必须在固件装载之后分配：装载 resident.bin 需要
+     * 连续 PSRAM，提前占用会让 fread 失败（实测读 resident.bin failed）。 */
+    if (!alloc_framebuffers()) {
+        return;
     }
     if (firmware_ok) {
         /* 固件装载后重设复位向量（cpu_reset 初次调用时 code_rom 尚未
