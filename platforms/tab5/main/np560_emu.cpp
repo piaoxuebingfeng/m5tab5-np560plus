@@ -98,35 +98,28 @@ static void emulator_task(void *arg)
 
     while (!s_cpu.halted) {
         uint64_t loop_insns = 0;
-        uint64_t t_exec0 = esp_timer_get_time();
-        uint64_t worst = 0, worst_pc = 0;
         for (int i = 0; i < 10000; i++) {
-            loop_insns++;
-            /* worst-insn 诊断降采样：逐指令 2 次 esp_timer_get_time()
-             * 在引导期累计上亿次调用（占 CPU 时间可观）。改为每 256
-             * 条指令取一次 256 指令块的平均耗时，保留热点定位能力。 */
-            bool t_sample = (i & 255) == 0;
-            uint64_t t0i = t_sample ? esp_timer_get_time() : 0;
-            dmcu_exec_step(s_bus, &s_cpu);
-            if (t_sample) {
-                uint64_t di = esp_timer_get_time() - t0i;
-                if (di > worst) {
-                    worst = di;
-                    worst_pc = s_cpu.pc;
-                }
+            /* 键盘唤醒（确定性修复）：原厂去抖是纯软件按 ISR 进入次数计数——
+             * 时基 ISR 每进入一次给 RAM 0490 +1，满 4 次才调一次键盘扫描，
+             * 去抖门 31:BE70 需连续 2 次扫描，共需 8 次真实进入 ISR。
+             *
+             * ICR RQ 是锁存位：受理时（irq_enter）清零，未受理时重复 raise
+             * 会合并成一次 ISR。因此只有当 RQ 已清（上一次 IRQ 确已被 CPU
+             * 接受）才注入下一个 tick，每个 tick 保证对应一次真实 ISR。
+             * 之前的实现在最内层 for 里每条指令无脑 raise，12 个 tick 在
+             * 头 12 条指令内合并成 1 次 ISR，补 tick 完全失效。 */
+            if (s_periph.key_wake_ticks &&
+                !(s_cpu.sfr[DMCU_ICR_FIRST] & DMCU_ICR_RQ)) {
+                s_periph.key_wake_ticks--;
+                s_periph.stat_key_wake_irq++;
+                dmcu_irq_raise(s_bus, &s_cpu, 0);
             }
+            loop_insns++;
+            dmcu_exec_step(s_bus, &s_cpu);
             if (s_cpu.halted) {
                 break;
             }
         }
-        ESP_LOGI(TAG, "burst: %llu insns, exec %lluus, worst 256blk %lluus "
-                 "@%02x:%04x",
-                 (unsigned long long)loop_insns,
-                 (unsigned long long)(esp_timer_get_time() - t_exec0),
-                 (unsigned long long)worst,
-                 (unsigned)((worst_pc >> 16) & 0xff),
-                 (unsigned)(worst_pc & 0xffff));
-        uint64_t t_exec = esp_timer_get_time() - t_exec0;
         total_insns += loop_insns;
         burst_insns += loop_insns;
         /* QEMU 主循环语义：EXEC_EXIT（CRIT/IGNDS 窗口到期、irq_state_changed
@@ -147,7 +140,6 @@ static void emulator_task(void *arg)
                 np560_periph_advance(&s_periph, delta);
             }
         }
-        uint64_t t_rest0 = esp_timer_get_time();
         /* 渲染节流到 ~20fps：PSRAM canvas 拷贝 + LVGL 重绘开销大，
          * 逐循环渲染曾占掉解释器大部分 CPU 时间（等效 >100fps）。 */
         {
@@ -160,16 +152,10 @@ static void emulator_task(void *arg)
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1));
-        uint64_t t_rest = esp_timer_get_time() - t_rest0;
         esp_task_wdt_reset();
-        if (t_exec > 1000000 || t_rest > 1000000) {
-            ESP_LOGW(TAG, "slow loop: exec %lluus for %llu insns, rest %lluus",
-                     (unsigned long long)t_exec,
-                     (unsigned long long)loop_insns,
-                     (unsigned long long)t_rest);
-        }
 
-        /* 节点②诊断：每 5s 报告 PC/真实指令速率/中断/不支持指令计数。 */
+        /* 每 5s 报告一次聚合状态。逐 burst 打印会在启动扫描期间产生
+         * 数万条串口日志，显著拖慢解释器；保留本摘要便于真机回归诊断。 */
         uint64_t now = esp_timer_get_time();
         if (now - last_report >= 5000000) {
             unsigned ips = (unsigned)(burst_insns / 5);
@@ -221,11 +207,20 @@ static void emulator_task(void *arg)
             /* 键盘诊断：观察 guest 是否真的在扫描 F160 矩阵。
              * mr=矩阵读次数 ma=读到有效按键次数 mask=当前物理键位。 */
             ESP_LOGI(TAG,
-                     "keypad: mr=%u ma=%u mask=%016llx code=%04x",
+                     "keypad: mr=%u ma=%u mask=%016llx code=%04x wake=%u kwirq=%u",
                      (unsigned)s_periph.keypad.matrix_reads,
                      (unsigned)s_periph.keypad.matrix_active_reads,
                      (unsigned long long)s_periph.keypad.matrix,
-                     (unsigned)s_periph.keypad.key_code);
+                     (unsigned)s_periph.keypad.key_code,
+                     (unsigned)s_periph.key_wake_ticks,
+                     (unsigned)s_periph.stat_key_wake_irq);
+            /* ADC 电量比较器诊断：level=8 满电；rd/wr 为固件采样次数。
+             * control 是最后一次写入的 threshold<<2|2，bit7 不应被固件写。 */
+            ESP_LOGI(TAG, "adc: level=%u ctrl=%04x rd=%u wr=%u",
+                     (unsigned)s_periph.adc_level,
+                     (unsigned)s_periph.adc_control,
+                     (unsigned)s_periph.adc_reads,
+                     (unsigned)s_periph.adc_writes);
             /* 诊断：SFR/MMIO 写事件全列表（低频关键写不被热点淹没）
              * + 读热点 top4。SFR reg 原样、MMIO 前缀 M（physical>>1）。 */
             {

@@ -10,6 +10,10 @@
 #include <string.h>
 #include "dmcu_exec.h"   /* dmcu_sfr_read/write：low SFR bank fallback */
 
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
 /* 节点②诊断：SFR 读写热点计数（np560_periph_diag_take 取走）。 */
 static uint32_t s_diag_reads[512];
 static uint32_t s_diag_writes[512];
@@ -60,6 +64,16 @@ static void np560_bus_mmio_write8(void *opaque, uint32_t flat_byte,
 #define NP560_MMIO_WORD_LOW  0xf100u
 #define NP560_MMIO_WORD_HIGH 0xf400u
 
+/* F2D0 ADC 电量比较器窗口（QEMU NP560_ADC_BASE=0xf2d0，size=0x06）：
+ *   F2D0/F2D1  ADC 控制/比较结果
+ *   F2D2/F2D3  CPU PLL  (DMCU_SFR_PLL)
+ *   F2D4/F2D5  Audio PLL (DMCU_SFR_AUDIO_PLL)
+ * 固件采样器 4F:C336 用 DS1 写逻辑 72D0，落到物理 F2D0。QEMU 默认
+ * adc_level=8（device.json），此前 Tab5 无此分支→恒读 0→电量等级 0，
+ * 触发原厂 "电压过低,请及时充电" 事件（PRG 31:6B30）。 */
+#define NP560_ADC_BASE       0xf2d0u
+#define NP560_ADC_SIZE       0x06u
+
 static uint16_t np560_bus_mmio_read(void *opaque, uint32_t physical)
 {
     Np560Periph *s = opaque;
@@ -86,6 +100,9 @@ static uint16_t np560_bus_mmio_read(void *opaque, uint32_t physical)
     if (physical >= NP560_NAND_CTRL_BASE &&
         physical < NP560_NAND_CTRL_BASE + NP560_NAND_CTRL_SIZE) {
         return np560_nand_mmio_read(&s->nand, physical - NP560_NAND_CTRL_BASE);
+    }
+    if (physical >= NP560_ADC_BASE && physical < NP560_ADC_BASE + NP560_ADC_SIZE) {
+        return np560_adc_read_reg(s, physical - NP560_ADC_BASE, 2);
     }
     /* low SFR bank fallback（np560.c:8946 np560_low_sfr_read）：
      * 物理 F100 + 2*reg 是 direct SFR 的 banked 别名。原厂在 DS0=1 下
@@ -133,6 +150,10 @@ static void np560_bus_mmio_write(void *opaque, uint32_t physical,
                               value);
         return;
     }
+    if (physical >= NP560_ADC_BASE && physical < NP560_ADC_BASE + NP560_ADC_SIZE) {
+        np560_adc_write_reg(s, physical - NP560_ADC_BASE, value, 2);
+        return;
+    }
     /* low SFR bank fallback（np560.c:8954 np560_low_sfr_write）：
      * 走 dmcu_sfr_write 以触发 sfr_device_write hook（TBC->timebase_write
      * 启动 64Hz 时基；TBICR->ICR[0].EN）。详见 read 侧注释。 */
@@ -140,6 +161,54 @@ static void np560_bus_mmio_write(void *opaque, uint32_t physical,
         dmcu_sfr_write(s->cpu, (physical - 0xf100u) >> 1, value, 16);
         return;
     }
+}
+
+/* ADC 电量比较器（对齐 QEMU np560_adc_value/read/write，np560.c:7715）：
+ * 采样器写 (threshold<<2)|2 到 F2D0、读回 bit7 作比较结果。
+ * level=8 时 threshold 0..7 全部断言 → 采样器返回满电等级 8。 */
+uint16_t np560_adc_read_reg(Np560Periph *s, unsigned offset, unsigned size)
+{
+    unsigned threshold;
+    uint16_t value;
+
+    if (offset >= 2) {
+        unsigned reg = offset < 4 ? DMCU_SFR_PLL : DMCU_SFR_AUDIO_PLL;
+
+        value = s->cpu->sfr[reg];
+        return size == 1 ? (value >> ((offset & 1) * 8)) & 0xff : value;
+    }
+    threshold = (s->adc_control >> 2) & 7;
+    value = s->adc_control & 0x007fu;
+    if (threshold < MIN(s->adc_level, 8u)) {
+        value |= 0x0080u;
+    }
+    s->adc_reads++;
+    return size == 1 ? (value >> ((offset & 1) * 8)) & 0xff : value;
+}
+
+void np560_adc_write_reg(Np560Periph *s, unsigned offset, uint16_t value,
+                         unsigned size)
+{
+    if (offset >= 2) {
+        unsigned reg = offset < 4 ? DMCU_SFR_PLL : DMCU_SFR_AUDIO_PLL;
+
+        if (size == 1) {
+            unsigned shift = (offset & 1) * 8;
+            uint16_t old = s->cpu->sfr[reg];
+
+            value = (old & ~(0xffu << shift)) | ((value & 0xffu) << shift);
+        }
+        s->cpu->sfr[reg] = value;
+        return;
+    }
+    if (size == 1) {
+        unsigned shift = (offset & 1) * 8;
+
+        value = (s->adc_control & ~(0xffu << shift)) |
+                ((value & 0xffu) << shift);
+    }
+    s->adc_control = value & 0x007fu;
+    s->adc_writes++;
 }
 
 /* 板级 SFR 设备读（np560.c:7804）。 */
@@ -180,6 +249,13 @@ void np560_periph_diag_take(Np560Periph *s, uint32_t *reads, uint32_t *writes)
 void np560_periph_init(Np560Periph *periph, DMCUCpu *cpu, Np560Bus *bus)
 {
     periph->cpu = cpu;
+    periph->key_wake_ticks = 0;
+    periph->stat_key_wake_irq = 0;
+    /* 对齐 QEMU device.json 的 adc_level=8（满电），避免开机误报低电。 */
+    periph->adc_control = 0;
+    periph->adc_level = 8;
+    periph->adc_reads = 0;
+    periph->adc_writes = 0;
     np560_timers_init(&periph->timers, cpu);
     np560_audio_init(&periph->audio, cpu);
     np560_lcd_reset(&periph->lcd);
@@ -206,4 +282,21 @@ void np560_periph_advance(Np560Periph *periph, uint64_t delta_cpu_cycles)
 {
     np560_timers_advance(&periph->timers, delta_cpu_cycles);
     np560_audio_advance(&periph->audio, delta_cpu_cycles);
+}
+
+void np560_periph_request_key_wake(Np560Periph *periph)
+{
+    /* 原厂去抖需 8 次真实进入 ISR（4 tick×2 次扫描）。注入侧按 RQ 已清
+     * 才注入下一 tick，部分 tick 可能被 CRIT 窗口/F01E guard 吞掉，故给
+     * 16 留约 2× 余量。每次按键重置为 16，保证长按连发也有充足 tick。 */
+    periph->key_wake_ticks = 16;
+}
+
+void np560_periph_request_key_release(Np560Periph *periph)
+{
+    /* 释放后必须跑至少一次无键扫描（27:E546..E55A）重新武装去抖门：
+     * 置 2A94=1（rearm）、清 2A8C=0。8 tick = 2 次完整扫描，留余量。
+     * 不补这一步时，紧接的下一次短按走连发路径（2A8C 需计到 6），
+     * 于是出现"按一次有响应、紧接着按一次无响应"的交替。 */
+    periph->key_wake_ticks = 8;
 }

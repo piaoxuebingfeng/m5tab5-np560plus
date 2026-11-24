@@ -84,6 +84,16 @@ static void on_key_event(m5_tab5_key_event_t event, void *arg)
         return;
     }
     np560_keypad_set_key(&periph->keypad, matrix, event.pressed);
+    /* 按下与释放都要请求时基 tick（不能从此 I2C 任务直接写 guest ICR，
+     * 否则会和解释器并发）：
+     *  - 按下：补足去抖所需的 8 次真实 ISR，让扫描器尽快读到按键；
+     *  - 释放：跑一次无键扫描重新武装去抖门（2A94=1/2A8C=0），否则
+     *    紧接着的下一次短按走连发路径而不响应。 */
+    if (event.pressed) {
+        np560_periph_request_key_wake(periph);
+    } else {
+        np560_periph_request_key_release(periph);
+    }
     ESP_LOGI(TAG, "KB key_id=%u row=%u col=%u pressed=%d -> matrix=%u mask=%016llx",
              key_id, event.row, event.col, (int)event.pressed, matrix,
              (unsigned long long)periph->keypad.matrix);
