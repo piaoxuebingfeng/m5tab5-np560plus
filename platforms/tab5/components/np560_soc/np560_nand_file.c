@@ -32,6 +32,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* io_trace() 在 ESP_PLATFORM 守卫之外使用日志/计时（引导期 I/O 诊断）。
+ * host 侧没有 ESP-IDF 头，这里给出空实现，保证源在两端都能编译。 */
+#ifndef ESP_PLATFORM
+#define ESP_LOGI(tag, fmt, ...) ((void)0)
+static inline int64_t host_io_trace_us(void) { return 0; }
+#define esp_timer_get_time() host_io_trace_us()
+#endif
+
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
 #include "esp_log.h"

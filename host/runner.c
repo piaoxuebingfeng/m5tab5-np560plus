@@ -1173,11 +1173,19 @@ static void test_n(void)
 
     printf("[N] NAND 文件介质 / code 平面\n");
 
-    /* 稀疏文件：truncate 到整片镜像大小，不占实际磁盘。 */
+    /* 稀疏文件：写 64B N1 容器头（np560_nand_file_medium_open 校验
+     * magic + ver=1），再 truncate 到整片镜像大小，不占实际磁盘。 */
     FILE *f = fopen(path, "wb");
     check("N create", f != NULL, 1);
     if (f) {
-        fseek(f, (long)((uint64_t)NP560_NAND_PAGES *
+        static const uint8_t magic[8] = { 'N', 'P', '5', '6', '0', 'N', '1', 0 };
+        uint8_t hdr[64];
+
+        memset(hdr, 0, sizeof(hdr));
+        memcpy(hdr, magic, sizeof(magic));
+        hdr[8] = 1;  /* ver */
+        fwrite(hdr, 1, sizeof(hdr), f);
+        fseek(f, (long)(sizeof(hdr) + (uint64_t)NP560_NAND_PAGES *
                         NP560_NAND_PAGE_TOTAL) - 1, SEEK_SET);
         fputc(0, f);
         fclose(f);
@@ -1305,6 +1313,57 @@ static void test_n(void)
     /* unlink(path); */
 }
 
+/* ---- O: ADC 电量比较器 F2D0（QEMU np560.c:7715 np560_adc_value） ----
+ * 低电误报根因回归：采样器 4F:C336 写 (threshold<<2)|2 到 F2D0、读回
+ * bit7 作比较结果；level=8 时 threshold 0..7 全部断言 → 满电等级 8。
+ * 同时验证 F2D2/F2D4 转发到 CPU/Audio PLL SFR。 */
+static void test_o(void)
+{
+    Np560Bus *bus;
+    DMCUCpu cpu;
+    Np560Periph periph;
+    unsigned threshold;
+
+    printf("[O] ADC 电量比较器 F2D0\n");
+    bus = np560_bus_create();
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.gpr[DMCU_SP] = 0x1000;
+    cpu.gpr[DMCU_FP] = 0x1000;
+    np560_periph_init(&periph, &cpu, bus);
+    cpu.sfr[DMCU_SFR_DS1] = 1;
+
+    check("O adc default level", periph.adc_level, 8);
+    /* 固件采样器逐 threshold 扫描：level=8 时每次读回 bit7=1。 */
+    for (threshold = 0; threshold < 8; threshold++) {
+        uint16_t written = (threshold << 2) | 2;
+
+        dmcu_translated_data_write(bus, &cpu, 0xf2d0, written, 16);
+        check("O adc bit7",
+              dmcu_translated_data_read(bus, &cpu, 0xf2d0, 16) & 0x0080u,
+              0x0080u);
+    }
+    check("O adc control masked", periph.adc_control & 0x0080u, 0);
+    /* F2D2 -> CPU PLL (0xe9)，F2D4 -> Audio PLL (0xea)。 */
+    dmcu_translated_data_write(bus, &cpu, 0xf2d2, 0x1234, 16);
+    check("O adc cpu pll", cpu.sfr[DMCU_SFR_PLL], 0x1234);
+    check("O adc cpu pll read",
+          dmcu_translated_data_read(bus, &cpu, 0xf2d2, 16), 0x1234);
+    dmcu_translated_data_write(bus, &cpu, 0xf2d4, 0x5678, 16);
+    check("O adc audio pll", cpu.sfr[DMCU_SFR_AUDIO_PLL], 0x5678);
+    /* 键盘唤醒：请求后补 16 个 tick（8 次 ISR × 2 余量），重复请求重置。 */
+    periph.key_wake_ticks = 3;
+    np560_periph_request_key_wake(&periph);
+    check("O key wake ticks", periph.key_wake_ticks, 16);
+    np560_periph_request_key_wake(&periph);
+    check("O key wake no accumulate", periph.key_wake_ticks, 16);
+    /* 释放也要补 tick 重新武装去抖门（否则下一次短按无响应）。 */
+    periph.key_wake_ticks = 20;
+    np560_periph_request_key_release(&periph);
+    check("O key release ticks", periph.key_wake_ticks, 8);
+
+    np560_bus_destroy(bus);
+}
+
 int main(void)
 {
     test_a();
@@ -1321,6 +1380,7 @@ int main(void)
     test_l();
     test_m();
     test_n();
+    test_o();
 
     if (failures) {
         printf("FAILED: %d checks\n", failures);
