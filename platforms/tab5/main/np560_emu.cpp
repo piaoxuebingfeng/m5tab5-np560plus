@@ -2,9 +2,9 @@
  * np560_emu.cpp - NP560+ 模拟器 Tab5 宿主实现。
  *
  * 显示：ST7529 可见面 240x120（5 级灰度浓度）-> RGB565 -> LVGL9 canvas
- *       （5x 最近邻放大到 1200x600 居中；np560_lcd_render 含 COMSCN/
- *        模块接线/部分显示语义。放大在内部 SRAM 行缓冲展开后整行 memcpy
- *        到 PSRAM canvas，避免逐像素 PSRAM 写风暴）
+ *       （3x 最近邻放大到 720x360 居中；np560_lcd_render 含 COMSCN/
+ *        模块接线/部分显示语义。仅当源帧内容变化时才放大+invalidate，
+ *        静止界面零渲染开销——避免拖慢固件启动）
  * 输入：Tab5 物理键盘桥（I2C 0x6D）-> NP560 矩阵；TODO 触摸皮肤
  * 存储：TF 卡 /sd/noahnp560/（用户约定：不放根目录）：
  *       NP560.PRG -> data 平面 0x30000（vma03）、resident.bin -> code ROM
@@ -33,19 +33,20 @@
 
 static const char *TAG = "np560";
 
-#define LCD_SCALE     5u
-#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)   /* 1200 */
-#define CANVAS_H      (NP560_LCD_HEIGHT * LCD_SCALE)  /* 600 */
+#define LCD_SCALE     3u
+#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)   /* 720 */
+#define CANVAS_H      (NP560_LCD_HEIGHT * LCD_SCALE)  /* 360 */
 
 static Np560Bus *s_bus;
 static DMCUCpu s_cpu;
 static Np560Periph s_periph;
 static lv_obj_t *s_canvas;
 static lv_image_dsc_t s_canvas_img;
-/* RGB565 canvas（放大后 1200x600 = 1.4MB）放 PSRAM；面板源帧 240x120
- * 也放 PSRAM；行展开缓冲放内部 SRAM（见 render_frame）。 */
+/* RGB565 canvas（放大后 720x360 = 518KB）放 PSRAM；面板源帧 240x120
+ * 与上一帧副本放 PSRAM 用于变化检测；行展开缓冲放内部 SRAM。 */
 static uint16_t *s_canvas_buf;
 static uint16_t *s_frame;
+static uint16_t *s_prev_frame;
 static DRAM_ATTR uint16_t s_row[CANVAS_W];  /* 一行放大像素，内部 SRAM */
 
 /* PSRAM 大缓冲分配（启动早期调用）。失败返回 false。 */
@@ -54,35 +55,47 @@ static bool alloc_framebuffers()
     s_canvas_buf = (uint16_t *)heap_caps_malloc(
         CANVAS_W * CANVAS_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     s_frame = (uint16_t *)heap_caps_malloc(
-        NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t),
-        MALLOC_CAP_SPIRAM);
-    if (!s_canvas_buf || !s_frame) {
+        NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    s_prev_frame = (uint16_t *)heap_caps_malloc(
+        NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!s_canvas_buf || !s_frame || !s_prev_frame) {
         ESP_LOGE(TAG, "framebuffer alloc failed (psram?)");
         free(s_canvas_buf);
         free(s_frame);
+        free(s_prev_frame);
         s_canvas_buf = NULL;
         s_frame = NULL;
+        s_prev_frame = NULL;
         return false;
     }
     memset(s_canvas_buf, 0, CANVAS_W * CANVAS_H * sizeof(uint16_t));
     memset(s_frame, 0, NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t));
+    memset(s_prev_frame, 0, NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t));
     return true;
 }
 
-/* ST7529 可见面 -> RGB565 源帧 -> 5x 最近邻放大到 canvas。
- * 每行先在内部 SRAM 的 s_row 展开 240→1200 像素（内部写很快），
- * 再 memcpy 5 行到 PSRAM canvas：每帧仅 120 次整行 memcpy（共 1.4MB），
- * 而不是 72 万次逐像素 PSRAM 写。LVGL image scale 方案实测会卡死在
- * lv_inv_area（放大对象的 invalidate 与渲染任务竞争），已弃用。 */
+/* ST7529 可见面 -> RGB565 源帧 -> 3x 最近邻放大到 canvas。
+ * 关键：源帧内容未变时直接返回，不做放大/memcpy/invalidate。NP560 界面
+ * 大部分时间静止（桌面/菜单），启动期固件也常在等待，静止帧零开销，
+ * 避免渲染拖慢固件推进（实测 5x 每帧全刷会把 IPS 压到 11 万、启动 >3min）。
+ * 变化时每行先在内部 SRAM 的 s_row 展开 240→720，再 memcpy 3 行到 PSRAM。 */
 static void render_frame()
 {
+    const size_t frame_px = NP560_LCD_WIDTH * NP560_LCD_HEIGHT;
     np560_lcd_render(&s_periph.lcd, s_frame, NP560_LCD_WIDTH);
+    if (memcmp(s_frame, s_prev_frame, frame_px * sizeof(uint16_t)) == 0) {
+        return; /* 无变化：跳过放大与 LVGL 重绘 */
+    }
+    memcpy(s_prev_frame, s_frame, frame_px * sizeof(uint16_t));
+
     for (unsigned y = 0; y < NP560_LCD_HEIGHT; y++) {
         const uint16_t *src = s_frame + (size_t)y * NP560_LCD_WIDTH;
         for (unsigned x = 0; x < NP560_LCD_WIDTH; x++) {
             uint16_t c = src[x];
             uint16_t *d = s_row + x * LCD_SCALE;
-            d[0] = d[1] = d[2] = d[3] = d[4] = c;
+            for (unsigned k = 0; k < LCD_SCALE; k++) {
+                d[k] = c;
+            }
         }
         uint16_t *dst = s_canvas_buf + (size_t)y * LCD_SCALE * CANVAS_W;
         for (unsigned k = 0; k < LCD_SCALE; k++) {
