@@ -1350,16 +1350,40 @@ static void test_o(void)
           dmcu_translated_data_read(bus, &cpu, 0xf2d2, 16), 0x1234);
     dmcu_translated_data_write(bus, &cpu, 0xf2d4, 0x5678, 16);
     check("O adc audio pll", cpu.sfr[DMCU_SFR_AUDIO_PLL], 0x5678);
-    /* 键盘唤醒：请求后补 16 个 tick（8 次 ISR × 2 余量），重复请求重置。 */
+    /* 键盘唤醒：预置去抖（路线②）后补 tick 减少，重复请求重置。 */
     periph.key_wake_ticks = 3;
     np560_periph_request_key_wake(&periph);
-    check("O key wake ticks", periph.key_wake_ticks, 16);
+    check("O key wake ticks", periph.key_wake_ticks, 6);
+    check("O key wake request", periph.key_debounce_request, 1);
     np560_periph_request_key_wake(&periph);
-    check("O key wake no accumulate", periph.key_wake_ticks, 16);
+    check("O key wake no accumulate", periph.key_wake_ticks, 6);
     /* 释放也要补 tick 重新武装去抖门（否则下一次短按无响应）。 */
     periph.key_wake_ticks = 20;
     np560_periph_request_key_release(&periph);
-    check("O key release ticks", periph.key_wake_ticks, 8);
+    check("O key release ticks", periph.key_wake_ticks, 4);
+    check("O key release request", periph.key_debounce_request, 2);
+
+    /* 路线②：应用预置去抖应直写 0490=4、2A8C(字节)>=2，且不碰 2A94。
+     * 内部 X RAM 0490 = 字；外部 RAM 2A8C 物理 0x512A8C 按 ^1 高字节车道
+     * 落在 phys[0x512A8D]；2A94 保持 idle 原值 1（armed）。 */
+    {
+        uint16_t w0490;
+        bus->phys[0x512a8cu] = 0;
+        bus->phys[0x512a8du] = 0;
+        bus->internal_data[0x490] = 0;
+        bus->internal_data[0x491] = 0;
+        bus->phys[0x512a94u] = 1;   /* idle armed */
+        np560_periph_apply_fast_debounce(&periph, bus);
+        w0490 = (uint16_t)(bus->internal_data[0x490] |
+                           (bus->internal_data[0x491] << 8));
+        check("O fast 0490=4", w0490, 4);
+        check("O fast 2A8C byte>=2", bus->phys[0x512a8du] >= 2, 1);
+        check("O fast 2A94 armed kept", bus->phys[0x512a94u], 1);
+        check("O fast request cleared", periph.key_debounce_request, 0);
+        check("O fast stat", periph.stat_debounce_fast, 1);
+        /* 无请求时应用应为空操作。 */
+        check("O fast noop", np560_periph_apply_fast_debounce(&periph, bus), 0);
+    }
 
     np560_bus_destroy(bus);
 }
