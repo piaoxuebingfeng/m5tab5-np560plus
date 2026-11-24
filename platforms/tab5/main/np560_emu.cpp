@@ -317,6 +317,18 @@ void np560_emu_start()
         uint64_t m1 = esp_timer_get_time();
         ESP_LOGW(TAG, "mem bench: phys %uus/100k (sum=%u)",
                  (unsigned)(m1 - m0), (unsigned)sum);
+        /* internal_data 落位验证：内部 SRAM 命中时此处应显著快于 phys。 */
+        {
+            volatile uint32_t isum = 0;
+            uint64_t i0 = esp_timer_get_time();
+            for (unsigned i = 0; i < 100000u; i++) {
+                isum += s_bus->internal_data[(i * 977u) & 0xffffu];
+            }
+            uint64_t i1 = esp_timer_get_time();
+            ESP_LOGW(TAG, "mem bench: internal %uus/100k (sum=%u, ptr=%p)",
+                     (unsigned)(i1 - i0), (unsigned)isum,
+                     (void *)s_bus->internal_data);
+        }
     }
     /* 外设组合层：定时器/音频 SFR 钩子 + LCD/键盘/NAND/ECC MMIO 钩子。 */
     np560_periph_init(&s_periph, &s_cpu, s_bus);

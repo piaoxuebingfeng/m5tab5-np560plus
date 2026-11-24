@@ -21,6 +21,7 @@
  */
 #include "dmcu_exec.h"
 #include "dmcu_irq.h"
+#include "esp_attr.h"   /* IRAM_ATTR：host shim 为空；ESP32 搬热点到内部 SRAM */
 
 void dmcu_unsupported(Np560Bus *bus, DMCUCpu *cpu, uint32_t pc, uint16_t word)
 {
@@ -912,7 +913,7 @@ static bool exec_exponent(Np560Bus *bus, DMCUCpu *cpu, uint8_t op, uint8_t arg)
 
 /* ---- 主入口：取指 + 分发 + 完成收尾 ---- */
 
-uint32_t dmcu_exec_step(Np560Bus *bus, DMCUCpu *cpu)
+IRAM_ATTR uint32_t dmcu_exec_step(Np560Bus *bus, DMCUCpu *cpu)
 {
     uint32_t start = cpu->pc;
     uint16_t word0 = dmcu_code_read16(bus, start);

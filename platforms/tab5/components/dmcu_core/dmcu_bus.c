@@ -17,6 +17,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
+#else
+#include "esp_attr.h"   /* host shim：IRAM_ATTR 为空 */
+#endif
+
+/* 内部 X/Y/DPRAM（64KB）是每条 guest 指令数据读写的最热目标。
+ * ESP32-P4 上普通 calloc 会落到 PSRAM，每次访存跨 PSRAM 总线；
+ * 优先放内部 SRAM（DIRAM 空闲 ~158KB），失败再回退普通分配。 */
+static uint8_t *alloc_internal_data(void)
+{
+#ifdef ESP_PLATFORM
+    uint8_t *p = (uint8_t *)heap_caps_malloc(DMCU_INTERNAL_SIZE,
+                                             MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+
+    if (p) {
+        memset(p, 0, DMCU_INTERNAL_SIZE);
+        return p;
+    }
+#endif
+    return (uint8_t *)calloc(1, DMCU_INTERNAL_SIZE);
+}
+
 Np560Bus *np560_bus_create(void)
 {
     Np560Bus *bus = calloc(1, sizeof(Np560Bus));
@@ -24,7 +48,7 @@ Np560Bus *np560_bus_create(void)
     if (!bus) {
         return NULL;
     }
-    bus->internal_data = calloc(1, DMCU_INTERNAL_SIZE);
+    bus->internal_data = alloc_internal_data();
     bus->phys = calloc(1, DMCU_PHYS_SIZE);
     if (!bus->internal_data || !bus->phys) {
         free(bus->internal_data);
@@ -80,7 +104,7 @@ static bool unbanked_sfr_word(uint32_t physical, uint32_t *banked)
 /* 物理总线 16 位访问（小端）。入参不裁剪：IGNDS unbanked SFR 页
  * （0x01000800+）位于 24 位字空间之上，先于兜底分支识别；最终 phys[]
  * 访问前裁剪到 24 位。 */
-static uint16_t phys_read16(Np560Bus *bus, uint32_t physical)
+static IRAM_ATTR uint16_t phys_read16(Np560Bus *bus, uint32_t physical)
 {
     uint32_t banked;
 
@@ -197,7 +221,7 @@ void dmcu_phys_write8(Np560Bus *bus, uint32_t logical_byte, uint8_t value)
  * 的近似——data 平面 ROM 镜像非 0（seed）或 loader 写入 veneer 时被取指
  * 观察到；data 为 0 时回落 ROM 本体。
  */
-uint16_t dmcu_code_read16(Np560Bus *bus, uint32_t address)
+IRAM_ATTR uint16_t dmcu_code_read16(Np560Bus *bus, uint32_t address)
 {
     uint32_t a = address & MASK24;
 
@@ -211,7 +235,11 @@ uint16_t dmcu_code_read16(Np560Bus *bus, uint32_t address)
         return (uint16_t)(p[0] | (p[1] << 8));
     }
     if (a >= 0x30000u && a < 0x430000u) {
-        return phys_read16(bus, a);     /* NP560.PRG（双平面共享） */
+        /* PRG 区快路径：该区间与 unbanked SFR(0x1000800+)、LCD MMIO
+         * (0xf00000)、SFR(0xf100..0xf400)、X RAM(<0x8000) 均不重叠，
+         * phys_read16 的四层分支在此恒为假。直接读 phys[] 跳过它们。
+         * a+1 <= 0x430001，远在 16MB phys 范围内。 */
+        return (uint16_t)(bus->phys[a] | (bus->phys[a + 1] << 8));
     }
     if (a >= 0x200000u) {
         return 0x0f00u;                 /* vma03 模式 missing-soc-rom */
