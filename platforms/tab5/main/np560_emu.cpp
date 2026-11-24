@@ -198,6 +198,24 @@ static void emulator_task(void *arg)
                          (unsigned)nf->stat_oob_prefetch,
                          (unsigned)nf->stat_oob_hits);
             }
+            /* 时基/中断诊断：定位 idle loop 不响应键盘的根因。
+             * tb=运行频率 exp=tick次数 run=是否启动
+             * tbicr=ICR[0](EN|RQ) socr=全局中断控制(bit15=IE)
+             * icr1..3=周期定时器 ICR（诊断仲裁为何选中不了中断源）。 */
+            {
+                Np560Timers *tm = &s_periph.timers;
+                ESP_LOGI(TAG,
+                         "timebase: hz=%u exp=%llu run=%d acc=%llu "
+                         "tbicr=%04x socr=%04x psr=%04x irqchg=%d",
+                         (unsigned)tm->timebase.frequency_hz,
+                         (unsigned long long)tm->timebase.expirations,
+                         (int)tm->timebase.running,
+                         (unsigned long long)tm->timebase.acc_num,
+                         (unsigned)s_cpu.sfr[DMCU_ICR_FIRST + 0],
+                         (unsigned)s_cpu.sfr[DMCU_SFR_SOCR],
+                         (unsigned)s_cpu.sfr[DMCU_SFR_PSW],
+                         (int)s_cpu.irq_state_changed);
+            }
             /* 键盘诊断：观察 guest 是否真的在扫描 F160 矩阵。
              * mr=矩阵读次数 ma=读到有效按键次数 mask=当前物理键位。 */
             ESP_LOGI(TAG,
