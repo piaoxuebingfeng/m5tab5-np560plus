@@ -8,6 +8,7 @@
  */
 #include "np560_periph.h"
 #include <string.h>
+#include "dmcu_exec.h"   /* dmcu_sfr_read/write：low SFR bank fallback */
 
 /* 节点②诊断：SFR 读写热点计数（np560_periph_diag_take 取走）。 */
 static uint32_t s_diag_reads[512];
@@ -86,6 +87,15 @@ static uint16_t np560_bus_mmio_read(void *opaque, uint32_t physical)
         physical < NP560_NAND_CTRL_BASE + NP560_NAND_CTRL_SIZE) {
         return np560_nand_mmio_read(&s->nand, physical - NP560_NAND_CTRL_BASE);
     }
+    /* low SFR bank fallback（np560.c:8946 np560_low_sfr_read）：
+     * 物理 F100 + 2*reg 是 direct SFR 的 banked 别名。原厂在 DS0=1 下
+     * 写逻辑 715E/71A0 启动 64Hz 时基，经 bank 映射落到 F15E(TBC)/
+     * F1A0(TBICR)。QEMU 的 low_sfr_banked_alias 覆盖这一区；此前 Tab5
+     * 把它当未映射地址读 0，导致 TBICR.EN 永为 0、时基不启动、idle
+     * loop 无 64Hz 中断可跳出，键盘矩阵永远不被扫描。 */
+    if (physical >= 0xf100u && physical < 0xf200u) {
+        return dmcu_sfr_read(s->cpu, (physical - 0xf100u) >> 1, 16);
+    }
     return 0;
 }
 
@@ -121,6 +131,13 @@ static void np560_bus_mmio_write(void *opaque, uint32_t physical,
         physical < NP560_NAND_CTRL_BASE + NP560_NAND_CTRL_SIZE) {
         np560_nand_mmio_write(&s->nand, physical - NP560_NAND_CTRL_BASE,
                               value);
+        return;
+    }
+    /* low SFR bank fallback（np560.c:8954 np560_low_sfr_write）：
+     * 走 dmcu_sfr_write 以触发 sfr_device_write hook（TBC->timebase_write
+     * 启动 64Hz 时基；TBICR->ICR[0].EN）。详见 read 侧注释。 */
+    if (physical >= 0xf100u && physical < 0xf200u) {
+        dmcu_sfr_write(s->cpu, (physical - 0xf100u) >> 1, value, 16);
         return;
     }
 }
