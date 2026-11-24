@@ -79,9 +79,14 @@ static void on_key_event(m5_tab5_key_event_t event, void *arg)
     }
     matrix = s_tab5_to_np560[key_id];
     if (matrix == 0xff) {
+        ESP_LOGI(TAG, "KB unmapped key_id=%u row=%u col=%u",
+                 key_id, event.row, event.col);
         return;
     }
     np560_keypad_set_key(&periph->keypad, matrix, event.pressed);
+    ESP_LOGI(TAG, "KB key_id=%u row=%u col=%u pressed=%d -> matrix=%u mask=%016llx",
+             key_id, event.row, event.col, (int)event.pressed, matrix,
+             (unsigned long long)periph->keypad.matrix);
 }
 
 /* 键盘模块探活/重试任务：成功后由组件轮询任务驱动回调。 */

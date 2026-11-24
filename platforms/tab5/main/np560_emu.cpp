@@ -198,6 +198,14 @@ static void emulator_task(void *arg)
                          (unsigned)nf->stat_oob_prefetch,
                          (unsigned)nf->stat_oob_hits);
             }
+            /* 键盘诊断：观察 guest 是否真的在扫描 F160 矩阵。
+             * mr=矩阵读次数 ma=读到有效按键次数 mask=当前物理键位。 */
+            ESP_LOGI(TAG,
+                     "keypad: mr=%u ma=%u mask=%016llx code=%04x",
+                     (unsigned)s_periph.keypad.matrix_reads,
+                     (unsigned)s_periph.keypad.matrix_active_reads,
+                     (unsigned long long)s_periph.keypad.matrix,
+                     (unsigned)s_periph.keypad.key_code);
             /* 诊断：SFR/MMIO 写事件全列表（低频关键写不被热点淹没）
              * + 读热点 top4。SFR reg 原样、MMIO 前缀 M（physical>>1）。 */
             {
