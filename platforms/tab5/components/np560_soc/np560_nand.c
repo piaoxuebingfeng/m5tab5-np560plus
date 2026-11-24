@@ -145,14 +145,6 @@ static bool nand_read_oob_stream(Np560Nand *nand, uint32_t page, uint8_t *out)
             }
             oob = page_bytes + NP560_NAND_PAGE_DATA;
         }
-        {
-            /* 诊断：OOB 流读页号采样（观察扫描模式）。 */
-            static unsigned oob_diag;
-            if (oob_diag++ % 128 == 0) {
-                ESP_LOGI("np560_nand", "oob read page=%u (#%u)",
-                         (unsigned)target_page, oob_diag);
-            }
-        }
         memcpy(out + copied, oob + target_column, chunk);
         copied += chunk;
         offset += chunk;
@@ -222,10 +214,6 @@ static void nand_dma_in(Np560Nand *nand, uint8_t *bytes)
 static void nand_execute(Np560Nand *nand)
 {
     uint8_t page_bytes[NP560_NAND_PAGE_TOTAL];
-    /* 节点②诊断：前 24 次命令打印详情；之后每 512 次打印 READ 页号
-     * 一次，观察固件 NAND 扫描的访问模式（顺序/随机）。 */
-    static unsigned diag_count;
-    unsigned diag_slot = diag_count++;
     uint8_t stream[NP560_NAND_OOB_STREAM_MAX];
     uint32_t page = nand_page(nand);
     uint32_t column = nand_dma_column(nand);
@@ -245,24 +233,6 @@ static void nand_execute(Np560Nand *nand)
         } else {
             if (!medium_read_page(nand, page, page_bytes)) {
                 return;
-            }
-            if (diag_slot % 64 == 0) {
-                ESP_LOGI("np560_nand", "read#%u page=%u", diag_slot,
-                         (unsigned)page);
-            }
-            if (diag_slot < 24) {
-                ESP_LOGI("np560_nand",
-                         "read page=%u col=%u len=%u buf=%05x d[%02x %02x "
-                         "%02x %02x %02x %02x %02x %02x]",
-                         (unsigned)page, (unsigned)column, (unsigned)nand->length,
-                         (unsigned)nand_dma_buffer(nand),
-                         page_bytes[column], page_bytes[column + 1],
-                         page_bytes[column + 2], page_bytes[column + 3],
-                         page_bytes[column + 4], page_bytes[column + 5],
-                         page_bytes[column + 6], page_bytes[column + 7]);
-            } else if (diag_slot % 512 == 0) {
-                ESP_LOGI("np560_nand", "scan page=%u (#%u)",
-                         (unsigned)page, diag_slot);
             }
             nand_dma_out(nand, page_bytes + column);
         }
@@ -302,10 +272,6 @@ static void nand_execute(Np560Nand *nand)
         if (page >= NP560_NAND_PAGES) {
             nand_set_failure(nand, NP560_NAND_ERROR_PAGE);
             return;
-        }
-        if (diag_slot < 40) {
-            ESP_LOGW("np560_nand", "erase block=%u (page=%u)",
-                     (unsigned)(page / NP560_NAND_PAGES_PER_BLOCK), (unsigned)page);
         }
         page -= page % NP560_NAND_PAGES_PER_BLOCK;
         if (!nand->medium.erase_block ||
