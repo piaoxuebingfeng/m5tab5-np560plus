@@ -1,0 +1,10 @@
+.cache
+.vscode
+build
+dependencies
+managed_components
+.DS_Store
+sdkconfig.old
+host/dmcu_runner
+*.pyc
+__pycache__/
