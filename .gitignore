@@ -6,5 +6,6 @@ managed_components
 .DS_Store
 sdkconfig.old
 host/dmcu_runner
+host/dmcu_bench
 *.pyc
 __pycache__/

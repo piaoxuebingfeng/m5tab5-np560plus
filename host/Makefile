@@ -10,7 +10,13 @@ SOC_SRCS = $(wildcard ../platforms/tab5/components/np560_soc/*.c)
 dmcu_runner: runner.c $(CORE_SRCS) $(SOC_SRCS)
 	$(CC) $(CFLAGS) -o $@ runner.c $(CORE_SRCS) $(SOC_SRCS)
 
-clean:
-	rm -f dmcu_runner
+dmcu_bench: bench.c $(CORE_SRCS) $(SOC_SRCS)
+	$(CC) $(CFLAGS) -o $@ bench.c $(CORE_SRCS) $(SOC_SRCS)
 
-.PHONY: clean
+bench: dmcu_bench
+	./dmcu_bench
+
+clean:
+	rm -f dmcu_runner dmcu_bench
+
+.PHONY: clean bench
