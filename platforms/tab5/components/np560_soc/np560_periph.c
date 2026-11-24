@@ -251,6 +251,8 @@ void np560_periph_init(Np560Periph *periph, DMCUCpu *cpu, Np560Bus *bus)
     periph->cpu = cpu;
     periph->key_wake_ticks = 0;
     periph->stat_key_wake_irq = 0;
+    periph->key_debounce_request = 0;
+    periph->stat_debounce_fast = 0;
     /* 对齐 QEMU device.json 的 adc_level=8（满电），避免开机误报低电。 */
     periph->adc_control = 0;
     periph->adc_level = 8;
@@ -286,17 +288,50 @@ void np560_periph_advance(Np560Periph *periph, uint64_t delta_cpu_cycles)
 
 void np560_periph_request_key_wake(Np560Periph *periph)
 {
-    /* 原厂去抖需 8 次真实进入 ISR（4 tick×2 次扫描）。注入侧按 RQ 已清
-     * 才注入下一 tick，部分 tick 可能被 CRIT 窗口/F01E guard 吞掉，故给
-     * 16 留约 2× 余量。每次按键重置为 16，保证长按连发也有充足 tick。 */
-    periph->key_wake_ticks = 16;
+    /* 按下：请求在指令边界预置去抖状态（跳过 0490 累加空转）。注入侧按
+     * RQ 已清才注入下一 tick，部分 tick 可能被 CRIT 窗口吞掉，保留少量
+     * 余量。预置后不再需要 16 tick 走满 8 次 ISR。 */
+    periph->key_debounce_request = 1;
+    periph->key_wake_ticks = 6;
 }
 
 void np560_periph_request_key_release(Np560Periph *periph)
 {
-    /* 释放后必须跑至少一次无键扫描（27:E546..E55A）重新武装去抖门：
-     * 置 2A94=1（rearm）、清 2A8C=0。8 tick = 2 次完整扫描，留余量。
-     * 不补这一步时，紧接的下一次短按走连发路径（2A8C 需计到 6），
-     * 于是出现"按一次有响应、紧接着按一次无响应"的交替。 */
-    periph->key_wake_ticks = 8;
+    /* 释放：请求预置 + 补无键扫描，让 guest 扫描器重新武装 2A94=1、
+     * 清 2A8C=0（QEMU oracle 实证释放后 50ms 内 2A8C→0/2A94→1）。
+     * 不补这一步时，下一次短按走连发路径而不响应。 */
+    periph->key_debounce_request = 2;
+    periph->key_wake_ticks = 4;
+}
+
+int np560_periph_apply_fast_debounce(Np560Periph *periph, Np560Bus *bus)
+{
+    uint8_t req = periph->key_debounce_request;
+
+    if (!req || !bus) {
+        return 0;
+    }
+    periph->key_debounce_request = 0;
+    periph->stat_debounce_fast++;
+
+    /* 0490（内部 X RAM 物理字 0x0490）：时基 ISR 每进入 +1、满 4 调一次
+     * 27:E528 扫描。预置为 4 让下一次 ISR 立即触发扫描，跳过 3 次空转。
+     * 内部 X RAM 走 internal_data，字节序小端（phys_write16 同款）。 */
+    if (bus->internal_data) {
+        bus->internal_data[0x490] = 4;
+        bus->internal_data[0x491] = 0;
+    }
+
+    /* 2A8C（外部 RAM 字节，Guest DS0=0xA2 → 物理 0x512A8C）：去抖计数。
+     * QEMU oracle：按下后第 1 次扫描 2A8C(字节)=1，第 2 次=2 时生成事件。
+     * 预置为 2 让本次扫描即满足去抖门；配合 2A94 保持 1（armed），guest
+     * 扫描器仍原生走事件管线（28D6/2A8A/candidate++），不会漏事件。
+     * 逻辑字节地址按 ^1 高字节车道 → 物理 0x512A8D。 */
+    if (bus->phys) {
+        bus->phys[0x512a8du] = 2;   /* 高字节 = guest 字节 2A8C 的值 */
+    }
+
+    /* 2A94（armed 锁存，物理 0x512A94 字）不写：由 guest 扫描器在生成
+     * 事件时清 0、释放无键扫描时置 1。直写会破坏事件生成时序。 */
+    return req;
 }

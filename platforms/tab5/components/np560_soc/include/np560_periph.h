@@ -39,6 +39,13 @@ typedef struct Np560Periph {
      * 按住期间持续补 tick 才能把响应压回原厂的 ~125ms。 */
     volatile uint32_t key_wake_ticks;
     uint32_t stat_key_wake_irq;  /* 实际注入并被接受时基 IRQ 累计数（诊断） */
+    /* 快速去抖请求（路线②预置）：键盘任务置位 pressed/release 方向，模拟器
+     * 任务在指令边界消费并直写 guest RAM 的 0490/2A8C，跳过"0490 累加到 4"
+     * 的 4 次时基 ISR 空转。2A94（armed 锁存）由 guest 扫描器原生管理，
+     * 不直写——QEMU oracle 实证 2A94=1 是 rearmed、0 是事件已生成，写 0
+     * 会阻止事件生成。0=无请求/1=按下/2=释放。 */
+    volatile uint8_t key_debounce_request;
+    uint32_t stat_debounce_fast;  /* 预置去抖生效次数（诊断） */
     /* ADC 电量比较器（对应 QEMU NP560ADCState，F2D0）。 */
     uint16_t adc_control;
     uint8_t adc_level;      /* 0..8，对齐 QEMU adc-level 属性，默认 8 满电 */
@@ -69,6 +76,12 @@ void np560_periph_request_key_wake(Np560Periph *periph);
  * 否则下次短按会走连发路径（计数需到 6）而不响应。补 8 tick（2 次
  * 扫描）让 rearm 立即完成，消除"按一次有、紧接着按一次无"的交替现象。 */
 void np560_periph_request_key_release(Np560Periph *periph);
+
+/* 在指令边界把预置的去抖状态写入 guest RAM（0490/2A8C），并返回本次应
+ * 注入的时基 tick 数。仅由模拟器任务调用，避免与解释器并发改 guest RAM。
+ * 内部 X RAM 0490 = 字，直接写 internal_data[0x490..491]；
+ * 外部 RAM 2A8C = 字节，DS0=0xA2→物理 0x512A8C，按 ^1 高字节车道写。 */
+int np560_periph_apply_fast_debounce(Np560Periph *periph, Np560Bus *bus);
 
 /* ADC 电量比较器（F2D0，对齐 QEMU np560_adc_read/write）。固件采样器
  * 4F:C336 写 (threshold<<2)|2 后读回，bit7 为比较结果；level=8 时所有

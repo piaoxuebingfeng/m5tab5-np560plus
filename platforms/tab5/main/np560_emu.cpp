@@ -108,6 +108,13 @@ static void emulator_task(void *arg)
              * 接受）才注入下一个 tick，每个 tick 保证对应一次真实 ISR。
              * 之前的实现在最内层 for 里每条指令无脑 raise，12 个 tick 在
              * 头 12 条指令内合并成 1 次 ISR，补 tick 完全失效。 */
+            /* 路线②：在指令边界消费预置去抖请求，直写 guest RAM 的
+             * 0490=4 / 2A8C=2，跳过"0490 累加到 4"的 3 次 ISR 空转；
+             * 2A94（armed）保持 guest 原生管理，扫描器仍真实生成事件。
+             * 与解释器串行，避免键盘 I2C 任务并发改 guest RAM。 */
+            if (s_periph.key_debounce_request) {
+                np560_periph_apply_fast_debounce(&s_periph, s_bus);
+            }
             if (s_periph.key_wake_ticks &&
                 !(s_cpu.sfr[DMCU_ICR_FIRST] & DMCU_ICR_RQ)) {
                 s_periph.key_wake_ticks--;
@@ -207,13 +214,14 @@ static void emulator_task(void *arg)
             /* 键盘诊断：观察 guest 是否真的在扫描 F160 矩阵。
              * mr=矩阵读次数 ma=读到有效按键次数 mask=当前物理键位。 */
             ESP_LOGI(TAG,
-                     "keypad: mr=%u ma=%u mask=%016llx code=%04x wake=%u kwirq=%u",
+                     "keypad: mr=%u ma=%u mask=%016llx code=%04x wake=%u kwirq=%u fast=%u",
                      (unsigned)s_periph.keypad.matrix_reads,
                      (unsigned)s_periph.keypad.matrix_active_reads,
                      (unsigned long long)s_periph.keypad.matrix,
                      (unsigned)s_periph.keypad.key_code,
                      (unsigned)s_periph.key_wake_ticks,
-                     (unsigned)s_periph.stat_key_wake_irq);
+                     (unsigned)s_periph.stat_key_wake_irq,
+                     (unsigned)s_periph.stat_debounce_fast);
             /* ADC 电量比较器诊断：level=8 满电；rd/wr 为固件采样次数。
              * control 是最后一次写入的 threshold<<2|2，bit7 不应被固件写。 */
             ESP_LOGI(TAG, "adc: level=%u ctrl=%04x rd=%u wr=%u",
