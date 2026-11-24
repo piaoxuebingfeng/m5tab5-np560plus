@@ -189,14 +189,16 @@ static void emulator_task(void *arg)
                 Np560NandFileMedium *nf =
                     (Np560NandFileMedium *)s_periph.nand.medium.user;
                 ESP_LOGI(TAG,
-                         "nand: reads=%u prog=%u erase=%u dirty=%u flushed=%u pf=%u rf=%u op=%u oh=%u",
+                         "nand: reads=%u prog=%u erase=%u dirty=%u flushed=%u pf=%u rf=%u op=%u oh=%u os=%u om=%u",
                          (unsigned)nf->stat_reads, (unsigned)nf->stat_programs,
                          (unsigned)nf->stat_erases, (unsigned)nf->stat_dirty,
                          (unsigned)nf->stat_flushed,
                          (unsigned)nf->stat_prefetch_fail,
                          (unsigned)nf->stat_read_fails,
                          (unsigned)nf->stat_oob_prefetch,
-                         (unsigned)nf->stat_oob_hits);
+                         (unsigned)nf->stat_oob_hits,
+                         (unsigned)nf->stat_oob_sparse_hits,
+                         (unsigned)nf->stat_oob_sparse_misses);
             }
             /* 时基/中断诊断：定位 idle loop 不响应键盘的根因。
              * tb=运行频率 exp=tick次数 run=是否启动

@@ -40,7 +40,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#define NP560_WB_SLOTS 1024u    /* 1024 页 × 2112B ≈ 2.1MB PSRAM */
+/* 写回槽：引导期 dirty=0（实测），无需 1024 个。缩到 256 个释放
+ * ~1.6MB 连续 PSRAM，供 OOB 稀疏索引（~3.9MB）分配。 */
+#define NP560_WB_SLOTS 256u     /* 256 页 × 2112B ≈ 528KB PSRAM */
 
 /* 读失败采样日志：分支码区分失败来源（I/O 错 vs 缓存逻辑错）。 */
 #define NF_FAIL_LOG(branch, pg)                                            \
@@ -99,6 +101,256 @@ static long file_oob_offset(const Np560NandFileMedium *m, uint32_t page)
                   (uint64_t)m->pages * NP560_NAND_PAGE_DATA +
                   (uint64_t)page * NP560_NAND_PAGE_OOB);
 }
+
+#ifdef ESP_PLATFORM
+/* ---- OOB 稀疏索引：把引导期数万次 SD 随机读压成一次性顺序扫描 ----
+ * QEMU oracle 证实固件启动对 OOB 平面做多遍扫描（off=0 len=64 整页 OOB），
+ * 每次块预取在 TF 卡上 ≈4ms；14.7 万次读累计 150s+。镜像 262144 页中
+ * OOB 非全 FF 的仅 ~53481，压缩存储只需 ~3.4MB。
+ *
+ * 存储格式（为 PSRAM 碎片优化，不要求单个 3.4MB 连续块）：
+ *   present: 262144-bit 位图，标记哪些页 OOB 非全 FF；
+ *   rank:    每 256 页的累计非 FF 页数（u16），用于 O(1) 定位；
+ *   chunks:  64 个数据块（每 4096 页一块），块内只紧存非 FF 页的 64B，
+ *            按需分配并倍增扩容——实测 PSRAM 空闲 3.53MB / 最大连续
+ *            块 3.4MB，单个 3.9MB 数组分配必失败。
+ * 构建时顺序读 16MB OOB 平面（一次线性扫描），之后只读页走 RAM 查询。
+ * 已编程页（prog_bitmap）不走本索引——其内容可能已不同于镜像基线。 */
+#define OOB_SPARSE_CHUNKS 64u
+#define OOB_CHUNK_PAGES   4096u
+/* QEMU oracle：把 OOB 低 32 字节全置 FF 后固件仍正常进桌面（每日一句）。
+ * 即引导期只读 OOB[32..63]（ECC/FTL tag 区），低半区从不参与决策。
+ * 只索引高 32 字节，索引数据从 3.4MB 降到 1.7MB——实测 PSRAM 空闲
+ * 3.53MB 但最大连续块仅 3.4MB，全量索引因碎片分配失败。 */
+#define OOB_SPARSE_HALF    32u
+
+typedef struct {
+    uint8_t present[NP560_NAND_PAGES / 8];
+    uint16_t rank[NP560_NAND_PAGES / 256];
+    uint32_t chunk_base[OOB_SPARSE_CHUNKS];
+    uint32_t chunk_counts[OOB_SPARSE_CHUNKS];
+    uint32_t chunk_caps[OOB_SPARSE_CHUNKS];
+    uint8_t *chunks[OOB_SPARSE_CHUNKS];
+    uint32_t total;
+} OobSparse;
+
+static const uint8_t oob_ff[NP560_NAND_PAGE_OOB] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
+
+/* 前向声明：构建后立即用查询路径自检（要求两者索引语义完全一致）。 */
+static bool oob_sparse_lookup(const Np560NandFileMedium *m, uint32_t page,
+                              uint8_t *out);
+
+/* 构建期抽样：每个 chunk 取一个非 FF 页，构建完成后回读比对。
+ * 这样 FAT 阶段之前就能在日志里看到索引是否正确，不再靠间接症状猜。 */
+#define OOB_SAMPLE_MAX OOB_SPARSE_CHUNKS
+typedef struct {
+    uint32_t page;
+    uint8_t high[OOB_SPARSE_HALF];
+} OobSample;
+
+static void oob_sparse_free(OobSparse *s)
+{
+    if (!s) {
+        return;
+    }
+    for (uint32_t i = 0; i < OOB_SPARSE_CHUNKS; i++) {
+        if (s->chunks[i]) {
+            heap_caps_free(s->chunks[i]);
+        }
+    }
+    heap_caps_free(s);
+}
+
+static void oob_sparse_build(Np560NandFileMedium *m)
+{
+    FILE *f = (FILE *)m->file;
+    OobSparse *s;
+    /* 一次 fread 读整个 chunk（4096 页 × 64B = 256KB）：4KB 小批量
+     * 在 FATFS 上要 4096 次命令，扫描 16MB 就花 10s；256KB 批量
+     * 只需 64 次，线性读速度提升一个数量级。 */
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(
+        (size_t)OOB_CHUNK_PAGES * NP560_NAND_PAGE_OOB, MALLOC_CAP_SPIRAM);
+    static OobSample samples[OOB_SAMPLE_MAX];
+    uint32_t sample_count = 0;
+    uint64_t t0;
+
+    if (!f || m->pages != NP560_NAND_PAGES) {
+        return;
+    }
+    if (!buf) {
+        ESP_LOGW("nand_file", "OOB scan buffer alloc failed; "
+                 "fallback to block prefetch");
+        return;
+    }
+    s = (OobSparse *)heap_caps_malloc(sizeof(OobSparse), MALLOC_CAP_SPIRAM);
+    if (!s) {
+        heap_caps_free(buf);
+        ESP_LOGW("nand_file", "OOB sparse header alloc failed; "
+                 "fallback to block prefetch");
+        return;
+    }
+    memset(s, 0, sizeof(*s));
+    t0 = esp_timer_get_time();
+    if (fseek(f, file_oob_offset(m, 0), SEEK_SET) != 0) {
+        heap_caps_free(buf);
+        oob_sparse_free(s);
+        return;
+    }
+    for (uint32_t page = 0; page < m->pages; page += OOB_CHUNK_PAGES) {
+        uint32_t chunk = page / OOB_CHUNK_PAGES;
+
+        s->chunk_base[chunk] = s->total;
+        if (fread(buf, NP560_NAND_PAGE_OOB, OOB_CHUNK_PAGES, f) !=
+            OOB_CHUNK_PAGES) {
+            ESP_LOGW("nand_file", "OOB sparse scan short read at page=%u",
+                     (unsigned)page);
+            heap_caps_free(buf);
+            oob_sparse_free(s);
+            return;
+        }
+        for (uint32_t i = 0; i < OOB_CHUNK_PAGES; i++) {
+            const uint8_t *oob = buf + (size_t)i * NP560_NAND_PAGE_OOB;
+            uint32_t p = page + i;
+
+            /* rank[段] = 进入该 256 页段"之前"的非 FF 累计数。查询时
+             * 以它为 base 再加 [段起点, page) 的 present popcount。
+             * 必须在段起点、无条件记录：写在段末尾会把段内每页索引
+             * 整体偏移，FTL tag 读到别的页的数据 → FAT init 崩溃。 */
+            if ((p & 255u) == 0u) {
+                s->rank[p / 256] = (uint16_t)s->total;
+            }
+            if (memcmp(oob + OOB_SPARSE_HALF, oob_ff,
+                       NP560_NAND_PAGE_OOB - OOB_SPARSE_HALF) == 0) {
+                continue; /* 高半区全 FF：查询时返回 FF 即可 */
+            }
+            if (s->chunk_counts[chunk] >= s->chunk_caps[chunk]) {
+                uint32_t newcap = s->chunk_caps[chunk] ?
+                                  s->chunk_caps[chunk] * 2 : 128;
+                uint8_t *newbuf = (uint8_t *)heap_caps_malloc(
+                    (size_t)newcap * OOB_SPARSE_HALF, MALLOC_CAP_SPIRAM);
+
+                if (!newbuf) {
+                    ESP_LOGW("nand_file", "OOB sparse chunk=%u alloc %u failed "
+                             "(free=%u largest=%u); fallback to block prefetch",
+                             (unsigned)chunk, (unsigned)newcap,
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                             (unsigned)heap_caps_get_largest_free_block(
+                                 MALLOC_CAP_SPIRAM));
+                    heap_caps_free(buf);
+                    oob_sparse_free(s);
+                    return;
+                }
+                if (s->chunks[chunk]) {
+                    memcpy(newbuf, s->chunks[chunk],
+                           (size_t)s->chunk_counts[chunk] * OOB_SPARSE_HALF);
+                    heap_caps_free(s->chunks[chunk]);
+                }
+                s->chunks[chunk] = newbuf;
+                s->chunk_caps[chunk] = newcap;
+            }
+            s->present[p / 8] |= (uint8_t)(1u << (p % 8));
+            memcpy(s->chunks[chunk] +
+                       (size_t)s->chunk_counts[chunk] * OOB_SPARSE_HALF,
+                   oob + OOB_SPARSE_HALF, OOB_SPARSE_HALF);
+            s->chunk_counts[chunk]++;
+            s->total++;
+            /* 每 chunk 采一个非 FF 页（chunk 内第一个即够，覆盖全地址域）。 */
+            if (i == 0 && sample_count < OOB_SAMPLE_MAX) {
+                samples[sample_count].page = p;
+                memcpy(samples[sample_count].high, oob + OOB_SPARSE_HALF,
+                       OOB_SPARSE_HALF);
+                sample_count++;
+            }
+        }
+    }
+    heap_caps_free(buf);
+    m->oob_sparse = s;
+    ESP_LOGI("nand_file", "OOB sparse index ready: %u pages (%uKB data, "
+             "high %uB only), scan %llums",
+             (unsigned)s->total,
+             (unsigned)(s->total * OOB_SPARSE_HALF / 1024),
+             (unsigned)OOB_SPARSE_HALF,
+             (unsigned long long)((esp_timer_get_time() - t0) / 1000));
+    /* 自检：用查询路径回读样本，高半区必须逐字节一致。全 FF 页样本
+     * （少数 chunk 首块恰为 FF）只能用全 FF 结果比对。 */
+    {
+        uint8_t out[NP560_NAND_PAGE_OOB];
+        uint32_t pass = 0;
+
+        for (uint32_t i = 0; i < sample_count; i++) {
+            bool all_ff = true;
+
+            for (uint32_t j = 0; j < OOB_SPARSE_HALF; j++) {
+                if (samples[i].high[j] != 0xff) {
+                    all_ff = false;
+                    break;
+                }
+            }
+            oob_sparse_lookup(m, samples[i].page, out);
+            if (memcmp(out + OOB_SPARSE_HALF, samples[i].high,
+                       OOB_SPARSE_HALF) == 0) {
+                pass++;
+            } else {
+                ESP_LOGE("nand_file", "OOB index self-check FAIL page=%u "
+                         "want=%02x%02x got=%02x%02x",
+                         (unsigned)samples[i].page,
+                         samples[i].high[0], samples[i].high[1],
+                         out[OOB_SPARSE_HALF], out[OOB_SPARSE_HALF + 1]);
+            }
+            (void)all_ff;
+        }
+        ESP_LOGI("nand_file", "OOB index self-check: %u/%u passed",
+                 (unsigned)pass, (unsigned)sample_count);
+    }
+}
+
+static bool oob_sparse_lookup(const Np560NandFileMedium *m, uint32_t page,
+                              uint8_t *out)
+{
+    const OobSparse *s = (const OobSparse *)m->oob_sparse;
+    uint32_t k, start, w0, w1, chunk, local;
+
+    /* 低半区从不参与固件决策（QEMU 掩码实验证实），统一返回 FF。 */
+    memset(out, 0xff, NP560_NAND_PAGE_OOB);
+    if ((s->present[page / 8] & (1u << (page % 8))) == 0) {
+        return true; /* 基线 OOB 高半区也全 FF */
+    }
+    start = (page / 256) * 256;
+    k = s->rank[page / 256];
+    w0 = start / 32;
+    w1 = (page - 1) / 32;
+    for (uint32_t w = w0; w <= w1; w++) {
+        uint32_t bits = ((const uint32_t *)s->present)[w];
+
+        if (w == w0) {
+            bits &= ~((1u << (start % 32)) - 1u);
+        }
+        if (w == w1) {
+            unsigned endbit = (page - 1) % 32;
+
+            bits &= (endbit == 31) ? 0xffffffffu : ((1u << (endbit + 1)) - 1u);
+        }
+        k += __builtin_popcount(bits);
+    }
+    chunk = page / OOB_CHUNK_PAGES;
+    local = k - s->chunk_base[chunk];
+    if (local < s->chunk_counts[chunk] && s->chunks[chunk]) {
+        memcpy(out + OOB_SPARSE_HALF,
+               s->chunks[chunk] + (size_t)local * OOB_SPARSE_HALF,
+               OOB_SPARSE_HALF);
+    }
+    return true;
+}
+#endif /* ESP_PLATFORM */
 
 static bool file_read_raw(void *user, uint32_t page, uint8_t *out)
 {
@@ -541,6 +793,16 @@ static bool file_read_oob(void *user, uint32_t page, uint8_t *out)
         m->stat_reads++;
         return true;
     }
+    /* OOB 稀疏索引：开机时已顺序扫描整个 OOB 平面，未编程页的基线
+     * OOB 从 RAM 二分查询返回，完全绕开 TF 卡随机 I/O。已编程页的
+     * 内容可能已不同于镜像基线，仍走下面的文件/块预取路径。 */
+    if (m->oob_sparse && !page_programmed(m, page)) {
+        oob_sparse_lookup(m, page, out);
+        m->stat_oob_sparse_hits++;
+        xSemaphoreGive((SemaphoreHandle_t)m->lock);
+        m->stat_reads++;
+        return true;
+    }
     {
         FILE *f = (FILE *)m->file;
         uint32_t block = page / NP560_NAND_PAGES_PER_BLOCK;
@@ -668,6 +930,9 @@ bool np560_nand_file_medium_open(Np560NandFileMedium *m, const char *path)
                     (TaskHandle_t *)&m->flush_task) != pdPASS) {
         m->flush_task = NULL;
     }
+    /* 一次性顺序扫描 16MB OOB 平面建索引；此后固件引导期的数万次
+     * OOB 随机读全部变成 RAM 二分查询（真机实测启动 150s+ → 数秒）。 */
+    oob_sparse_build(m);
     ESP_LOGI("nand_file", "file medium open: %s, build %s %s", path,
              __DATE__, __TIME__);
 #endif
@@ -720,6 +985,10 @@ void np560_nand_file_medium_close(Np560NandFileMedium *m)
     m->block_buf = NULL;
     free(m->oob_block_buf);
     m->oob_block_buf = NULL;
+    if (m->oob_sparse) {
+        oob_sparse_free((OobSparse *)m->oob_sparse);
+        m->oob_sparse = NULL;
+    }
 #else
     if (m->file) {
         fclose((FILE *)m->file);

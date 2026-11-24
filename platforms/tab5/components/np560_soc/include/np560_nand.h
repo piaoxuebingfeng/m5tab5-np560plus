@@ -121,6 +121,15 @@ typedef struct Np560NandFileMedium {
     uint32_t oob_prefetch_block; /* 已缓存块号，0xffffffff = 无效 */
     uint32_t stat_oob_prefetch;  /* 实际块预取次数 */
     uint32_t stat_oob_hits;      /* 块缓存命中次数 */
+    /* OOB 稀疏索引（启动提速主路径）：扫描发现固件引导期对 OOB 平面
+     * 发起数万次随机读（每次 fseek+fread 一块 4KB ≈ 4ms，累计 150s+）。
+     * 镜像里 262144 页仅 ~53481 页 OOB 非全 FF，故开机时一次性顺序
+     * 读取整个 16MB OOB 平面，把非 FF 页存成按页号排序的 (page,oob)
+     * 表（~3.6MB PSRAM）；之后未编程页的 OOB 读走二分查找，零 SD I/O。
+     * 已编程页仍走文件/写回槽，保证运行时写入可见。 */
+    void *oob_sparse;            /* OobSparse（PSRAM，分块紧凑存储） */
+    uint32_t stat_oob_sparse_hits;
+    uint32_t stat_oob_sparse_misses;
     /* 诊断统计（页单位）。 */
     uint32_t stat_reads;
     uint32_t stat_programs;
