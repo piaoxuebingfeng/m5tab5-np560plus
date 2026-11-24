@@ -488,8 +488,11 @@ void np560_lcd_render(const Np560Lcd *lcd, uint16_t *out, unsigned out_stride)
     for (y = 0; y < NP560_LCD_HEIGHT; y++) {
         for (x = 0; x < NP560_LCD_WIDTH && x < out_stride; x++) {
             unsigned darkness = st7529_visible_level(lcd, x, y);
-            /* 光学浓度 0..31 线性映射亮度（0=白/无驱动，31=黑）。 */
-            unsigned bright = darkness * 255u / 31u;
+            /* 光学浓度 0..31（0=无驱动=亮/白，31=满驱动=暗/黑）转亮度：
+             * 浓度越大越暗，故取 31-darkness。与 QEMU Web app.js 一致
+             * （value=0→off 浅色，value=31→on 深色）；写成 darkness 会
+             * 整幅反色（白底黑字变黑底白字）。 */
+            unsigned bright = (31u - darkness) * 255u / 31u;
             uint16_t r = (uint16_t)(bright >> 3);
             uint16_t g = (uint16_t)(bright >> 2);
             uint16_t b = (uint16_t)(bright >> 3);

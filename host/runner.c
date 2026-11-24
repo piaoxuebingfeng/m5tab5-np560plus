@@ -844,6 +844,16 @@ static void test_k(void)
     np560_lcd_command(&lcd, 0xaf);
     check("K DISON restores", np560_lcd_visible_level(&lcd, 0, 0), 31);
 
+    /* 渲染方向：浓度 31=满驱动=黑 → RGB565 0x0000；浓度 0=无驱动=白 → 0xFFFF。
+     * 与 QEMU Web app.js（value 越大越接近深色 on）一致；防止误改回反色。 */
+    {
+        uint16_t px[4]; /* stride=2，只需 (0,0)/(1,0) 两列。 */
+
+        np560_lcd_render(&lcd, px, 2);
+        check("K render dark pixel black", px[0], 0x0000);
+        check("K render light pixel white", px[1], 0xffff);
+    }
+
     /* 总线路由：DS0=0x1E0（480）→ 物理 0xF00000；字节车道 ^1 后
      * 偶平坦字节=命令/状态口（offset&2==0），奇=数据口。 */
     bus = np560_bus_create();

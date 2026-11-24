@@ -103,8 +103,9 @@ uint8_t np560_lcd_status_read(const Np560Lcd *lcd);
  * 驱动=亮），显示关/睡眠/部分显示未驱动电极返回 0。x<240, y<120。 */
 uint8_t np560_lcd_visible_level(const Np560Lcd *lcd, unsigned x, unsigned y);
 
-/* 渲染可见面 240x120 为 RGB565（光学浓度线性映射亮度，0=白）。
- * out_stride 为输出缓冲每行像素数。 */
+/* 渲染可见面 240x120 为 RGB565。光学浓度 0..31 取反后映射亮度：
+ * 浓度 0（无驱动）→白 0xFFFF，浓度 31（满驱动）→黑 0x0000，与 QEMU Web
+ * 前端方向一致。out_stride 为输出缓冲每行像素数。 */
 void np560_lcd_render(const Np560Lcd *lcd, uint16_t *out, unsigned out_stride);
 
 #ifdef __cplusplus
