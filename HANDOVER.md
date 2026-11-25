@@ -1,4 +1,5 @@
 # NP560+ 模拟器 → M5Stack Tab5 移植交接文档
+> 路径约定：`$REPO_ROOT` = 本仓库根目录，`$IDF_PATH` = ESP-IDF 安装目录，`$ORACLE_ROOT` = QEMU 参考工程根目录。
 
 | 项目 | 内容 |
 |---|---|
@@ -6,8 +7,8 @@
 | 编写日期 | 2026-11-24 |
 | 适用对象 | 接手本项目的开发者 / 未来的自己 |
 | 一句话现状 | 原厂 NP560.PRG + resident.bin 已在 Tab5（ESP32-P4）上原生解释执行，能进桌面、能响应物理键盘；正在优化开机速度（约 150s → 目标 <20s）。 |
-| 主战场工程 | `/home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/`（本目录，独立 git 仓库） |
-| 参考实现工程 | `/media/qiao/3b56c13d-bedc-441c-8da8-b6030fb755cb/github/Noah/np560-plus-emulator/`（QEMU 模拟器，语义权威 / oracle） |
+| 主战场工程 | `$REPO_ROOT/`（本目录，独立 git 仓库） |
+| 参考实现工程 | `$ORACLE_ROOT/`（QEMU 模拟器，语义权威 / oracle） |
 
 > 阅读顺序建议：第 1 章看懂"为什么这么做"，第 2～4 章知道"东西在哪、靠什么跑"，第 5～6 章照着命令操作，第 7 章了解踩过的坑，第 8～9 章接着干活。
 
@@ -85,7 +86,7 @@ NP560+ 真机（逆向对象）
 ### 2.1 主战场：Tab5 re-host 工程（本目录，有 git）
 
 ```
-/home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/          ← git 根（main 分支）
+$REPO_ROOT/          ← git 根（main 分支）
 ├── NP560_PORT.md                  移植进度清单 + 移植纪律（指令族逐一打勾）
 ├── HANDOVER.md                    本交接文档
 ├── README.md                      上游 M5Tab5-UserDemo 自带说明
@@ -123,7 +124,7 @@ NP560+ 真机（逆向对象）
 ### 2.2 参考实现：QEMU 模拟器工程（有 git）
 
 ```
-/media/qiao/3b56c13d-bedc-441c-8da8-b6030fb755cb/github/Noah/np560-plus-emulator/
+$ORACLE_ROOT/
 ├── qemu-dmcu/                     ★ QEMU 源码（new target: dmcu）
 │   ├── target/dmcu/               CPU：helper.c（语义权威）、translate.c、clock.c
 │   ├── hw/dmcu/                   SoC：np560.c（2 万行板级）、np560_timer.c 等
@@ -213,7 +214,7 @@ db72f42 Initial commit: NP560+ emulator port for M5Stack Tab5
 
 | 工具 | 版本 / 路径 | 用途 |
 |---|---|---|
-| ESP-IDF | **v5.4.2**，`/home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh` | Tab5 固件构建。**必须用 5.4.2**：5.5.3 与芯片 rev v1.0 不兼容；官方 UserDemo 要求 5.4.1 版本线。 |
+| ESP-IDF | **v5.4.2**，`$IDF_PATH/export.sh` | Tab5 固件构建。**必须用 5.4.2**：5.5.3 与芯片 rev v1.0 不兼容；官方 UserDemo 要求 5.4.1 版本线。 |
 | QEMU | `qemu-dmcu/build/qemu-system-dmcu`（8.2.10 np560-linux） | oracle；`ninja -C build qemu-system-dmcu` 增量编译。 |
 | 系统 Python | `/usr/bin/python3`（pyserial 3.5） | 串口抓日志。**WorkBuddy 的 managed Python 没有 serial 模块**，必须用系统版。 |
 | Python（脚本） | `/usr/bin/python3` 或 managed 3.13 均可 | QEMU Web 桥、离线分析脚本。 |
@@ -247,13 +248,13 @@ systemd-run --user --unit=<名> --collect /bin/bash -c '<命令>'
 ## 5. QEMU 模拟器运行 NP560 系统的方法（教学式）
 
 > 目标：从"开机上电那一刻"复现 NP560 启动画面。完整教学版见
-> `/media/qiao/3b56c13d-bedc-441c-8da8-b6030fb755cb/github/Noah/np560-plus-emulator/doc/guides/linux_boot_from_poweron.md`。
+> `$ORACLE_ROOT/doc/guides/linux_boot_from_poweron.md`。
 > **注意：QEMU 的 `-display` / VNC / screendump 都看不到画面**，必须用浏览器看 `/api/display`（LCD gray5 帧经 QOM `lcd-frame` 出来）。
 
 ### 第 1 步：检查关键文件
 
 ```bash
-ROOT=/media/qiao/3b56c13d-bedc-441c-8da8-b6030fb755cb/github/Noah/np560-plus-emulator
+ROOT=$ORACLE_ROOT
 ls -lh $ROOT/release/NP560.PRG $ROOT/release/resident.bin \
       $ROOT/release/system.nand $ROOT/device/device.json \
       $ROOT/qemu-dmcu/build/qemu-system-dmcu \
@@ -322,7 +323,7 @@ ss -lntp | grep 8765                                # 应无输出
 ### 6.1 host 回归测试（亚秒级，先跑这个）
 
 ```bash
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/host
+cd $REPO_ROOT/host
 make && ./dmcu_runner
 ```
 
@@ -331,8 +332,8 @@ make && ./dmcu_runner
 ### 6.2 ESP-IDF 编译
 
 ```bash
-source /home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh   # 必须 bash
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/platforms/tab5
+source $IDF_PATH/export.sh   # 必须 bash
+cd $REPO_ROOT/platforms/tab5
 idf.py set-target esp32p4   # 已配置过可跳过
 idf.py build
 ```
@@ -346,12 +347,12 @@ idf.py build
 ls -l /dev/ttyACM*
 
 # 烧录
-source /home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/platforms/tab5
+source $IDF_PATH/export.sh
+cd $REPO_ROOT/platforms/tab5
 idf.py -p /dev/ttyACM0 flash
 
 # 抓日志 90 秒（系统 Python！）
-/usr/bin/python3 /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/tools/serial_capture.py 90 \
+/usr/bin/python3 $REPO_ROOT/tools/serial_capture.py 90 \
   > /tmp/boot.log 2>&1
 ```
 
@@ -535,7 +536,7 @@ Tab5 仓库 `main` 分支，最新提交 `12e2593`，工作区应干净（除本
 
 ```bash
 # ---- QEMU oracle ----
-ROOT=/media/qiao/3b56c13d-bedc-441c-8da8-b6030fb755cb/github/Noah/np560-plus-emulator
+ROOT=$ORACLE_ROOT
 cd $ROOT && /usr/bin/python3 scripts/web/np560_web.py --device device/device.json \
   --host 127.0.0.1 --port 8765 --run-log-dir /tmp/np560-boot-runs
 curl -s -X POST http://127.0.0.1:8765/api/control -H 'Content-Type: application/json' \
@@ -544,15 +545,15 @@ curl -s http://127.0.0.1:8765/api/diagnostics
 cd $ROOT/qemu-dmcu/build && ninja qemu-system-dmcu       # QEMU 增量编译
 
 # ---- Tab5 host 回归 ----
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/host && make && ./dmcu_runner
+cd $REPO_ROOT/host && make && ./dmcu_runner
 
 # ---- Tab5 固件 ----
-source /home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/platforms/tab5
+source $IDF_PATH/export.sh
+cd $REPO_ROOT/platforms/tab5
 idf.py build && idf.py -p /dev/ttyACM0 flash
 
 # ---- 串口抓日志（系统 Python！）----
-/usr/bin/python3 /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/tools/serial_capture.py \
+/usr/bin/python3 $REPO_ROOT/tools/serial_capture.py \
   120 --no-reset > /tmp/boot.log 2>&1
 
 # ---- 清理 ----

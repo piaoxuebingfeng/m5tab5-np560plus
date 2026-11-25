@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -30,9 +31,13 @@ import numpy as np
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SRC = Path(
-    "/media/qiao/3b56c13d-bedc-441c-8da8-b6030fb755cb/github/Noah/"
-    "np560-plus-emulator/scripts/web/assets/np560plus-open-cutout.png"
+# 源图来自独立的 QEMU oracle 仓库；可用 NP560_ORACLE_ROOT 指向其根目录，
+# 或用 --src 显式指定。默认相对路径避免把本机绝对路径写进公开仓库。
+_ORACLE_ROOT = os.environ.get("NP560_ORACLE_ROOT")
+DEFAULT_SRC = (
+    Path(_ORACLE_ROOT) / "scripts/web/assets/np560plus-open-cutout.png"
+    if _ORACLE_ROOT
+    else Path("np560plus-open-cutout.png")
 )
 DEFAULT_OUT = ROOT / "app" / "assets" / "skin.raw"
 

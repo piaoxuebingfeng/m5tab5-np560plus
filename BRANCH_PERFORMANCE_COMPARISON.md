@@ -1,4 +1,5 @@
 # Tab5 分支性能对比与后续验证指南
+> 路径约定：`$REPO_ROOT` = 本仓库根目录，`$IDF_PATH` = ESP-IDF 安装目录，`$ORACLE_ROOT` = QEMU 参考工程根目录。
 
 | 项目 | 内容 |
 |---|---|
@@ -169,8 +170,8 @@ QEMU 用墙钟 ptimer 且逐 tick 交付，所以 QEMU 不能复现 Tab5 的 IPS
 ### 5.2 标准 A/B 流程
 
 ```bash
-REPO=/home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560
-IDF=/home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh
+REPO=$REPO_ROOT
+IDF=$IDF_PATH/export.sh
 
 # 1. 切分支（确认工作区干净）
 cd $REPO && git checkout main            # 或 backup/fastboot-cd8b335
@@ -178,14 +179,14 @@ git status --short --branch
 
 # 2. 编译（systemd-run 绕开沙箱；日志写在 unit 内）
 systemd-run --user --unit=np560-ab-build --collect --wait /bin/bash -c \
-  'source /home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh && \
-   cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/platforms/tab5 && \
+  'source $IDF_PATH/export.sh && \
+   cd $REPO_ROOT/platforms/tab5 && \
    idf.py build > /tmp/np560-ab-build.log 2>&1; echo BUILD_EXIT=$? >> /tmp/np560-ab-build.log'
 
 # 3. 烧录（先告知用户！）
 systemd-run --user --unit=np560-ab-flash --collect --wait /bin/bash -c \
-  'source /home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh && \
-   cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/platforms/tab5 && \
+  'source $IDF_PATH/export.sh && \
+   cd $REPO_ROOT/platforms/tab5 && \
    idf.py -p /dev/ttyACM0 flash > /tmp/np560-ab-flash.log 2>&1; echo FLASH_EXIT=$? >> /tmp/np560-ab-flash.log'
 ```
 
@@ -195,7 +196,7 @@ systemd-run --user --unit=np560-ab-flash --collect --wait /bin/bash -c \
 
 ```bash
 systemd-run --user --unit=np560-ab-capture --collect --wait /bin/bash -c \
-  '/usr/bin/python3 /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/tools/serial_capture.py 150 > /tmp/np560-ab-boot.log 2>&1'
+  '/usr/bin/python3 $REPO_ROOT/tools/serial_capture.py 150 > /tmp/np560-ab-boot.log 2>&1'
 ```
 
 关键时间戳（ESP-IDF 日志自带毫秒）：
@@ -279,13 +280,13 @@ I (...) np560: keypad: mr=... ma=... kwirq=... fast=...
 
 | 项目 | 值 |
 |---|---|
-| Tab5 工程 | `/home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/`（ESP-IDF 工程在 `platforms/tab5/`） |
-| ESP-IDF | **v5.4.2**，`/home/qiao/ESPIDF/esp-idf-v5.4.2/export.sh`（必须 bash source；5.5.3 不兼容） |
+| Tab5 工程 | `$REPO_ROOT/`（ESP-IDF 工程在 `platforms/tab5/`） |
+| ESP-IDF | **v5.4.2**，`$IDF_PATH/export.sh`（必须 bash source；5.5.3 不兼容） |
 | 设备 | `/dev/ttyACM0`（USB 直连） |
 | 串口抓取 | `/usr/bin/python3 tools/serial_capture.py <秒数> [--no-reset]` |
 | 快启抓日志 | `tools/wait_fastboot.py` |
 | host 回归 | `cd host && make dmcu_runner && ./dmcu_runner` |
-| QEMU oracle | `/media/qiao/.../np560-plus-emulator/`，Web 桥 `scripts/web/np560_web.py` |
+| QEMU oracle | `$ORACLE_ROOT/`，Web 桥 `scripts/web/np560_web.py` |
 | 沙箱绕过 | `systemd-run --user --unit=<名> --collect --wait`，长任务后台执行，结束清理 |
 
 ---

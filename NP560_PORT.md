@@ -1,4 +1,5 @@
 # NP560+ Tab5 移植（re-host）
+> 路径约定：`$REPO_ROOT` = 本仓库根目录，`$IDF_PATH` = ESP-IDF 安装目录，`$ORACLE_ROOT` = QEMU 参考工程根目录。
 
 本工程（`m5tab5-np560/`）是 **M5Stack Tab5（ESP32-P4）上的 NP560+ 模拟器
 re-host 工程主战场**：基于 M5Tab5-UserDemo 完整官方工程（保留其 app 框架、
@@ -206,14 +207,14 @@ esp32-tab5/
 ## host 快速回归
 
 ```bash
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/host && make && ./dmcu_runner
+cd $REPO_ROOT/host && make && ./dmcu_runner
 ```
 
 ## ESP-IDF 构建
 
 ```bash
 . ~/ESPIDF/esp-idf-v5.4.2/export.sh
-cd /home/qiao/00-opencode-ai/m5tab5-bbk/m5tab5-np560/platforms/tab5
+cd $REPO_ROOT/platforms/tab5
 idf.py set-target esp32p4   # 已配置过可跳过
 idf.py build flash monitor
 ```
