@@ -28,9 +28,10 @@ uint16_t np560_keypad_row_mask(unsigned row)
 }
 
 /* legacy 别名索引（np560.c:9118-9121）：与 web 矩阵恢复的开关位置一致
- * （左/右是 M45/M29）。 */
+ * （左/右是 M45/M29）。bit5=Escape 是返回键 M04(0x8E)，不再复用
+ * M28(0x84)（后者在词典正文里是"上一条释义"）。对齐 QEMU 6fcc208992。 */
 static const uint8_t legacy_matrix_indexes[16] = {
-    61, 37, 45, 29, 53, 28, 28, 37,
+    61, 37, 45, 29, 53, 4, 28, 37,
     60, 52, 44, 4, 61, 37, 54, 55,
 };
 
@@ -46,9 +47,10 @@ static uint16_t np560_keypad_event_alias(uint32_t raw)
     case 0x10d: /* page down */
         return 0x0083;
     case 0x102: /* left */
-    case 0x105: /* escape */
     case 0x106: /* backspace */
         return 0x0084;
+    case 0x105: /* escape -> 返回键 M04 (0x8E)，不是 0x84 */
+        return 0x008E;
     case 0x103: /* right */
     case 0x104: /* enter */
         return 0x0085;

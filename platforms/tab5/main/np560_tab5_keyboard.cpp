@@ -28,7 +28,7 @@ static const char *TAG = "np560_kb";
 /* Tab5 key_id → NP560 矩阵 index（col*8+row）。0xFF = 不映射。 */
 static const uint8_t s_tab5_to_np560[70] = {
     /* Row 0: ESC 1 2 3 4 5 6 7 8 9 0 - + DEL */
-    28,   /*  ESC -> Escape/Backspace 触点 (0x84 别名)  */
+    4,    /*  ESC -> 返回触点 M04 (0x8E)，不是 M28(0x84)  */
     2, 3, 0, 8, 16, 24, 32, 40, 48, 56,   /* 1..0（与 QWERTY 上排共触点） */
     20,   /*  '-' -> 逗号触点（最近标点）              */
     0xff, /*  '+'（NP560 无对应触点）                  */

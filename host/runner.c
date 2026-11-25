@@ -927,6 +927,11 @@ static void test_l(void)
     np560_keypad_mmio_write(&kp, NP560_KEYBOARD_BASE, 0);
     check("L F340 write-clear",
           np560_keypad_mmio_read(&kp, NP560_KEYBOARD_BASE), 0);
+    /* Escape 是返回键 M04(0x8E)，不与 Backspace/M28(0x84) 共用事件码。
+     * 回归 QEMU commit 6fcc208992 / PR #2（词典返回失效）。 */
+    np560_keypad_set_event_code(&kp, 0x105); /* escape */
+    check("L F340 escape event",
+          np560_keypad_mmio_read(&kp, NP560_KEYBOARD_BASE), 0x8e);
 
     /* legacy 位 4 = Enter → 矩阵 53（col6,row5）。 */
     np560_keypad_set_legacy_key(&kp, 4, true);
@@ -950,6 +955,16 @@ static void test_l(void)
           np560_keypad_matrix_input(&kp, kp.matrix_drive),
           0x00ff & ~(1u << 6));
     np560_keypad_set_legacy_key(&kp, 15, false);
+    /* legacy 位 5 = Escape → 返回触点 M04（col0,row4），不再指向 28。 */
+    np560_keypad_set_legacy_key(&kp, 5, true);
+    check("L legacy escape state",
+          np560_keypad_mmio_read(&kp, NP560_KEYBOARD_BASE + 2), 0x0020);
+    kp.matrix_drive =
+        (uint16_t)(0xffffu & ~np560_keypad_row_mask(4));
+    check("L legacy escape matrix",
+          np560_keypad_matrix_input(&kp, kp.matrix_drive),
+          0x00ff & ~(1u << 0));
+    np560_keypad_set_legacy_key(&kp, 5, false);
 
     /* F160 bit12 = 外部电源/充电输入。 */
     kp.external_power = true;
