@@ -854,6 +854,39 @@ static void test_k(void)
         check("K render light pixel white", px[1], 0xffff);
     }
 
+    /* 状态电极导出：对齐 QEMU np560_get_lcd_annunciators。
+     * plane0=GRAM line19、plane1=line140；level>0 才置位；bit 按 x 小端序；
+     * 显示关/睡眠全零。用独立 LCD 避免前面的窗口/扫向设置干扰。 */
+    {
+        Np560Lcd ann;
+        uint8_t planes[NP560_LCD_ANNUNCIATOR_BYTES];
+
+        np560_lcd_reset(&ann);
+        np560_lcd_annunciators(&ann, planes);
+        check("K ann sleeping zero", planes[0] + planes[30], 0);
+
+        ann.display_on = true;
+        ann.sleeping = false;
+        ann.gram[19][0] = 31;    /* plane0 bit0 */
+        ann.gram[19][8] = 5;     /* plane0 byte1 bit0（level>0 即置位） */
+        ann.gram[19][16] = 0;    /* plane0 byte2 bit0 保持清零 */
+        ann.gram[140][133] = 31; /* plane1 bit133 → byte46 bit5 */
+        ann.gram[140][228] = 31; /* plane1 bit228 → byte58 bit4 */
+        np560_lcd_annunciators(&ann, planes);
+        check("K ann plane0 bit0", (planes[0] & 1u) != 0, 1);
+        check("K ann plane0 byte1", (planes[1] & 1u) != 0, 1);
+        check("K ann plane0 zero level", (planes[2] & 1u) != 0, 0);
+        check("K ann plane1 bit133",
+              (planes[30 + (133 >> 3)] & (1u << (133 & 7))) != 0, 1);
+        check("K ann plane1 bit228",
+              (planes[30 + (228 >> 3)] & (1u << (228 & 7))) != 0, 1);
+        check("K ann plane1 no spill", planes[0], 0x01); /* line19 仅 bit8+bit0 */
+
+        ann.display_on = false;
+        np560_lcd_annunciators(&ann, planes);
+        check("K ann display off zero", planes[0] + planes[30 + 16], 0);
+    }
+
     /* 总线路由：DS0=0x1E0（480）→ 物理 0xF00000；字节车道 ^1 后
      * 偶平坦字节=命令/状态口（offset&2==0），奇=数据口。 */
     bus = np560_bus_create();

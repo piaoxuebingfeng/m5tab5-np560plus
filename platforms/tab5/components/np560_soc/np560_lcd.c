@@ -502,3 +502,31 @@ void np560_lcd_render(const Np560Lcd *lcd, uint16_t *out, unsigned out_stride)
         }
     }
 }
+
+/* 状态电极导出：严格对齐 QEMU np560_get_lcd_annunciators（np560.c:9911）。
+ * V3.80 resident 14:6E10 把两平面 240-bit 写到 GRAM line 19 / 140，
+ * 读取 output_level > 0 的原始电极状态，按 little-endian bit 打包。
+ * 这是只读硬件视图，不在此合成图标名称或电池百分比。 */
+void np560_lcd_annunciators(const Np560Lcd *lcd,
+                             uint8_t planes[NP560_LCD_ANNUNCIATOR_BYTES])
+{
+    static const unsigned lines[NP560_LCD_ANNUNCIATOR_PLANES] = {
+        NP560_LCD_VISIBLE_LINE - 1u,
+        NP560_LCD_VISIBLE_LINE + NP560_LCD_HEIGHT,
+    };
+    unsigned plane;
+    unsigned x;
+
+    memset(planes, 0, NP560_LCD_ANNUNCIATOR_BYTES);
+    if (!lcd->display_on || lcd->sleeping) {
+        return;
+    }
+    for (plane = 0; plane < NP560_LCD_ANNUNCIATOR_PLANES; plane++) {
+        for (x = 0; x < NP560_LCD_WIDTH; x++) {
+            if (st7529_output_level(lcd, x, lines[plane]) > 0) {
+                planes[plane * NP560_LCD_ANNUNCIATOR_BYTES_PER_PLANE +
+                       (x >> 3)] |= (uint8_t)(1u << (x & 7u));
+            }
+        }
+    }
+}

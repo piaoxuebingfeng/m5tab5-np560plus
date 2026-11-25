@@ -36,6 +36,17 @@ extern "C" {
 #define NP560_LCD_HEIGHT   120u   /* 可见面板高 */
 #define NP560_LCD_VISIBLE_LINE 20u
 
+/* 自定义玻璃状态电极（annunciator）：QEMU np560_get_lcd_annunciators 读取
+ * GRAM line 19 / 140 的 240-bit 电平，导出为 2 平面 × 30 字节。Web 前端在
+ * 主画面上方额外渲染 12 行图标，故完整源帧为 240x132。 */
+#define NP560_LCD_ANNUNCIATOR_HEIGHT 12u
+#define NP560_LCD_ANNUNCIATOR_PLANES 2u
+#define NP560_LCD_ANNUNCIATOR_BYTES_PER_PLANE 30u
+#define NP560_LCD_ANNUNCIATOR_BYTES \
+    (NP560_LCD_ANNUNCIATOR_PLANES * NP560_LCD_ANNUNCIATOR_BYTES_PER_PLANE)
+#define NP560_LCD_FRAME_HEIGHT \
+    (NP560_LCD_ANNUNCIATOR_HEIGHT + NP560_LCD_HEIGHT) /* 132 */
+
 /* ST7529 MMIO 物理基址（np560.c:34）。 */
 #define NP560_ST7529_BASE 0x00f00000u
 #define NP560_ST7529_MMIO_SIZE 4u
@@ -107,6 +118,12 @@ uint8_t np560_lcd_visible_level(const Np560Lcd *lcd, unsigned x, unsigned y);
  * 浓度 0（无驱动）→白 0xFFFF，浓度 31（满驱动）→黑 0x0000，与 QEMU Web
  * 前端方向一致。out_stride 为输出缓冲每行像素数。 */
 void np560_lcd_render(const Np560Lcd *lcd, uint16_t *out, unsigned out_stride);
+
+/* 导出两平面 240-bit 状态电极电平（与 QEMU np560_get_lcd_annunciators 逐位
+ * 一致）：plane0 = GRAM line 19，plane1 = line 140，bit 按 x 的小端序打包。
+ * 显示关/睡眠时全零。纯硬件状态，不合成任何图标语义或电池数值。 */
+void np560_lcd_annunciators(const Np560Lcd *lcd,
+                             uint8_t planes[NP560_LCD_ANNUNCIATOR_BYTES]);
 
 #ifdef __cplusplus
 }

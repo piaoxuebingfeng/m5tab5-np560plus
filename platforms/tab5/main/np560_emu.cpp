@@ -1,10 +1,11 @@
 /*
  * np560_emu.cpp - NP560+ 模拟器 Tab5 宿主实现。
  *
- * 显示：ST7529 可见面 240x120（5 级灰度浓度）-> RGB565 -> LVGL9 canvas
- *       （3x 最近邻放大到 720x360 居中；np560_lcd_render 含 COMSCN/
- *        模块接线/部分显示语义。仅当源帧内容变化时才放大+invalidate，
- *        静止界面零渲染开销——避免拖慢固件启动）
+ * 显示：ST7529 可见面 240x120 + 顶部 12 行状态图标 = 240x132 源帧
+ *       （5 级灰度浓度）-> RGB565 -> LVGL9 canvas（3x 最近邻放大到 720x396
+ *        居中；np560_lcd_render 含 COMSCN/模块接线/部分显示语义。
+ *        仅当源帧内容变化时才放大+invalidate，静止界面零渲染开销——
+ *        避免拖慢固件启动。图标位来自 GRAM line19/140，与 QEMU Web 一致）
  * 输入：Tab5 物理键盘桥（I2C 0x6D）-> NP560 矩阵；TODO 触摸皮肤
  * 存储：TF 卡 /sd/noahnp560/（用户约定：不放根目录）：
  *       NP560.PRG -> data 平面 0x30000（vma03）、resident.bin -> code ROM
@@ -34,16 +35,17 @@
 static const char *TAG = "np560";
 
 #define LCD_SCALE     3u
-#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)   /* 720 */
-#define CANVAS_H      (NP560_LCD_HEIGHT * LCD_SCALE)  /* 360 */
+#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)          /* 720 */
+#define CANVAS_H      (NP560_LCD_FRAME_HEIGHT * LCD_SCALE)   /* 396 = 132*3 */
 
 static Np560Bus *s_bus;
 static DMCUCpu s_cpu;
 static Np560Periph s_periph;
 static lv_obj_t *s_canvas;
 static lv_image_dsc_t s_canvas_img;
-/* RGB565 canvas（放大后 720x360 = 0.5MB）放 PSRAM；面板源帧 240x120
- * 与上一帧副本放 PSRAM 用于变化检测；行展开缓冲放内部 SRAM。 */
+/* RGB565 canvas（放大后 720x396 = 0.56MB）放 PSRAM；源帧 240x132
+ * （顶部 12 行状态图标 + 240x120 主画面）与上一帧副本放 PSRAM 用于变化检测；
+ * 行展开缓冲放内部 SRAM。 */
 static uint16_t *s_canvas_buf;
 static uint16_t *s_frame;
 static uint16_t *s_prev_frame;
@@ -55,9 +57,9 @@ static bool alloc_framebuffers()
     s_canvas_buf = (uint16_t *)heap_caps_malloc(
         CANVAS_W * CANVAS_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     s_frame = (uint16_t *)heap_caps_malloc(
-        NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        NP560_LCD_WIDTH * NP560_LCD_FRAME_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     s_prev_frame = (uint16_t *)heap_caps_malloc(
-        NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        NP560_LCD_WIDTH * NP560_LCD_FRAME_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
     if (!s_canvas_buf || !s_frame || !s_prev_frame) {
         ESP_LOGE(TAG, "framebuffer alloc failed (psram?)");
         free(s_canvas_buf);
@@ -69,27 +71,120 @@ static bool alloc_framebuffers()
         return false;
     }
     memset(s_canvas_buf, 0, CANVAS_W * CANVAS_H * sizeof(uint16_t));
-    memset(s_frame, 0, NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t));
-    memset(s_prev_frame, 0, NP560_LCD_WIDTH * NP560_LCD_HEIGHT * sizeof(uint16_t));
+    memset(s_frame, 0,
+           NP560_LCD_WIDTH * NP560_LCD_FRAME_HEIGHT * sizeof(uint16_t));
+    memset(s_prev_frame, 0,
+           NP560_LCD_WIDTH * NP560_LCD_FRAME_HEIGHT * sizeof(uint16_t));
     return true;
 }
 
-/* ST7529 可见面 -> RGB565 源帧 -> 3x 最近邻放大到 canvas。
- * 关键：源帧内容未变时直接返回，不做放大/memcpy/invalidate。NP560 界面
- * 大部分时间静止（桌面/菜单），启动期固件也常在等待，静止帧零开销，
- * 避免渲染拖慢固件推进（历史实测：无 diff 的 5x 每帧全刷会把 IPS 压到
- * 11 万、启动 >3min；加 diff 后 3x/4x 均 82s。本版为 3x+diff）。
- * 变化时每行先在内部 SRAM 的 s_row 展开 240→720，再 memcpy 3 行到 PSRAM。 */
+/* 状态图标点阵：逐点复刻 QEMU Web app.js 的 statusArtwork（8 行 × 9 列）。
+ * bit 是 plane1 的位号，x 是 240 宽源帧起点。只按 guest 导出的电极位决定
+ * 激活/淡显，不合成图标语义；形状/位置取自实机照片，与 Web 保持一致。 */
+typedef struct {
+    unsigned bit;
+    unsigned x;
+    const char *rows[8];
+} AnnunciatorArtwork;
+
+static const AnnunciatorArtwork s_ann_art[] = {
+    { 133, 92, { "000010000", "000111000", "001111100", "011111110",
+                 "000111000", "000111000", "000111000", "000111000" } },
+    { 150, 110, { "000100000", "001100000", "011111110", "111111110",
+                  "011111110", "001100000", "000100000", "000000000" } },
+    { 163, 128, { "000001000", "000001100", "011111110", "011111111",
+                  "011111110", "000001100", "000001000", "000000000" } },
+    { 179, 146, { "000111000", "000111000", "000111000", "000111000",
+                  "011111110", "001111100", "000111000", "000010000" } },
+    { 196, 164, { "000000000", "000000000", "000010000", "000111000",
+                  "001111100", "011111110", "000000000", "000000000" } },
+    { 211, 182, { "000000000", "000000000", "011111110", "001111100",
+                  "000111000", "000010000", "000000000", "000000000" } },
+};
+
+static uint16_t ann_gray565(unsigned bright)
+{
+    return (uint16_t)(((bright >> 3) << 11) | ((bright >> 2) << 5) |
+                      (bright >> 3));
+}
+
+static bool ann_bit(const uint8_t *planes, unsigned bit)
+{
+    return (planes[NP560_LCD_ANNUNCIATOR_BYTES_PER_PLANE + (bit >> 3)] &
+            (uint8_t)(1u << (bit & 7u))) != 0;
+}
+
+static void ann_fill(uint16_t *frame, unsigned x, unsigned y,
+                     unsigned w, unsigned h, uint16_t color)
+{
+    for (unsigned yy = y; yy < y + h && yy < NP560_LCD_ANNUNCIATOR_HEIGHT; yy++) {
+        for (unsigned xx = x; xx < x + w && xx < NP560_LCD_WIDTH; xx++) {
+            frame[yy * NP560_LCD_WIDTH + xx] = color;
+        }
+    }
+}
+
+/* 图标色阶沿用 Tab5 主画面的白底/黑字灰阶，避免与 240x120 主画面配色冲突；
+ * 未激活轮廓对应 Web 的 off*0.86+on*0.14（亮度 219）。 */
+static void draw_annunciators(uint16_t *frame)
+{
+    uint8_t planes[NP560_LCD_ANNUNCIATOR_BYTES];
+    const uint16_t bg = 0xffffu;
+    const uint16_t active = 0x0000u;
+    const uint16_t ghost = ann_gray565(219u);
+
+    np560_lcd_annunciators(&s_periph.lcd, planes);
+    ann_fill(frame, 0, 0, NP560_LCD_WIDTH, NP560_LCD_ANNUNCIATOR_HEIGHT, bg);
+
+    for (unsigned i = 0; i < sizeof(s_ann_art) / sizeof(s_ann_art[0]); i++) {
+        uint16_t color = ann_bit(planes, s_ann_art[i].bit) ? active : ghost;
+        for (unsigned row = 0; row < 8; row++) {
+            const char *bits = s_ann_art[i].rows[row];
+            for (unsigned col = 0; col < 9; col++) {
+                if (bits[col] == '1') {
+                    ann_fill(frame, s_ann_art[i].x + col, row + 2, 1, 1, color);
+                }
+            }
+        }
+    }
+
+    /* 电池：轮廓由 plane1 的 bit228/235 决定，4 组电量格独立叠加。 */
+    if (ann_bit(planes, 228) || ann_bit(planes, 235)) {
+        ann_fill(frame, 207, 2, 18, 1, active);
+        ann_fill(frame, 207, 9, 18, 1, active);
+        ann_fill(frame, 206, 3, 1, 6, active);
+        ann_fill(frame, 225, 3, 1, 6, active);
+        ann_fill(frame, 226, 5, 2, 3, active);
+        /* 单 bit 组用重复位号，语义仍等价于 Web 的 some() 判断。 */
+        static const unsigned level_bits[4][2] = {
+            { 224, 230 }, { 234, 234 }, { 232, 236 }, { 225, 238 },
+        };
+        for (unsigned level = 0; level < 4; level++) {
+            if (ann_bit(planes, level_bits[level][0]) ||
+                ann_bit(planes, level_bits[level][1])) {
+                ann_fill(frame, 208 + level * 4, 4, 3, 4, active);
+            }
+        }
+    }
+}
+
+/* ST7529 -> 240x132 源帧（顶部 12 行图标 + 120 行主画面）-> 3x 放大到 canvas。
+ * 关键：源帧内容未变时直接返回，不做放大/memcpy/invalidate。静止帧零开销。
+ * 主画面写入 s_frame+12 行，与 Web 的 annunciatorHeight=12 偏移一致；
+ * 放大循环/invalidate 语义不变，仍是整幅覆盖（三条安全不变量之一）。 */
 static void render_frame()
 {
-    const size_t frame_px = NP560_LCD_WIDTH * NP560_LCD_HEIGHT;
-    np560_lcd_render(&s_periph.lcd, s_frame, NP560_LCD_WIDTH);
+    const size_t frame_px = NP560_LCD_WIDTH * NP560_LCD_FRAME_HEIGHT;
+    np560_lcd_render(&s_periph.lcd,
+                     s_frame + NP560_LCD_ANNUNCIATOR_HEIGHT * NP560_LCD_WIDTH,
+                     NP560_LCD_WIDTH);
+    draw_annunciators(s_frame);
     if (memcmp(s_frame, s_prev_frame, frame_px * sizeof(uint16_t)) == 0) {
         return; /* 无变化：跳过放大与 LVGL 重绘 */
     }
     memcpy(s_prev_frame, s_frame, frame_px * sizeof(uint16_t));
 
-    for (unsigned y = 0; y < NP560_LCD_HEIGHT; y++) {
+    for (unsigned y = 0; y < NP560_LCD_FRAME_HEIGHT; y++) {
         const uint16_t *src = s_frame + (size_t)y * NP560_LCD_WIDTH;
         for (unsigned x = 0; x < NP560_LCD_WIDTH; x++) {
             uint16_t c = src[x];
@@ -404,7 +499,7 @@ void np560_emu_start()
     s_canvas = lv_canvas_create(lv_scr_act());
     lv_canvas_set_buffer(s_canvas, s_canvas_buf, CANVAS_W, CANVAS_H,
                          LV_COLOR_FORMAT_RGB565);
-    /* canvas 缓冲本身已是放大后的 720x360，居中于 1280x720 屏幕。 */
+    /* canvas 缓冲本身已是放大后的 720x396，居中于 1280x720 屏幕。 */
     lv_obj_center(s_canvas);
     memset(s_canvas_buf, 0, CANVAS_W * CANVAS_H * sizeof(uint16_t));
     render_frame();
