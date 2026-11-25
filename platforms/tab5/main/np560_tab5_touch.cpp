@@ -26,6 +26,10 @@
 
 static const char *TAG = "np560_touch";
 
+/* MP3 触摸入口临时禁用：进入 MP3 后按返回仍会触发 ROM TRAP 自陷，
+ * 修复前先关掉触摸入口（物理 MP3 键不受影响）。见 TODO.md。 */
+#define NP560_TOUCH_MP3_ENABLED 0
+
 /* Web 源热区：src_x/src_y/src_w/src_h（1254 坐标系）+ NP560 矩阵索引。 */
 struct TouchZone {
     uint16_t sx, sy, sw, sh;
@@ -50,7 +54,9 @@ static const TouchZone s_zones[] = {
     {1038, 198, 129, 37, 59, "sync-learn"},
     {1038, 258, 129, 37, 51, "multi-exam"},
     {1038, 318, 129, 37, 43, "my-disk"},
+#if NP560_TOUCH_MP3_ENABLED
     {1038, 377, 129, 37, 35, "mp3"},
+#endif
     /* 右侧光标键：上/左/确认/右/下 = M61/45/53/29/37 */
     {1080, 461, 58, 49, 61, "up"},
     {1039, 501, 50, 60, 45, "left"},
