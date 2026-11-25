@@ -34,6 +34,7 @@
 #include "np560_soc.h"
 #include "np560_periph.h"
 #include "np560_tab5_keyboard.h"
+#include "np560_tab5_touch.h"
 #include "np560_sd.h"
 
 static const char *TAG = "np560";
@@ -570,6 +571,8 @@ void np560_emu_start()
     /* canvas 缓冲即 1280x720 全屏，铺满逻辑屏（不再居中留黑边）。 */
     lv_obj_set_pos(s_canvas, 0, 0);
     render_frame();
+    /* 透明触摸热区叠在 canvas 之上（Web 上半部分机身按键），不改画面。 */
+    np560_tab5_touch_create(&s_periph);
     bsp_display_unlock();
 
     /* 优先级 10 + 核 1：诊断发现 exec 相位 10000 条耗时 7.8s（rest 仅
