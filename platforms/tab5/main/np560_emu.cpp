@@ -49,16 +49,6 @@ static uint16_t *s_frame;
 static uint16_t *s_prev_frame;
 static DRAM_ATTR uint16_t s_row[CANVAS_W];  /* 一行放大像素，内部 SRAM */
 
-/* P0 渲染统计（每 5 秒报告并清零）：验证脏行增量刷新是否真的减少
- * 放大/LVGL 重绘面积，同时确认没有拖慢解释器。 */
-static uint64_t s_render_calls;
-static uint64_t s_render_changed;
-static uint64_t s_render_dirty_rows;
-static uint64_t s_render_dirty_runs;
-static uint32_t s_render_max_dirty_rows;
-static uint64_t s_render_us_total;
-static uint64_t s_render_us_max;
-
 /* PSRAM 大缓冲分配（启动早期调用）。失败返回 false。 */
 static bool alloc_framebuffers()
 {
@@ -85,79 +75,35 @@ static bool alloc_framebuffers()
 }
 
 /* ST7529 可见面 -> RGB565 源帧 -> 5x 最近邻放大到 canvas。
- * P0：逐源行 diff，只放大连续变化的源行段，并只失效这些行在 canvas 中
- * 对应的区域。原来任何一处变化都会放大全幅并 invalidate 整块 1200x600；
- * 现在光标/状态栏等局部更新只需处理几行，5x 放大倍率与方向均不变。
- * 静止帧仍然零放大、零 invalidate。 */
+ * 关键：源帧内容未变时直接返回，不做放大/memcpy/invalidate。NP560 界面
+ * 大部分时间静止（桌面/菜单），启动期固件也常在等待，静止帧零开销，
+ * 避免渲染拖慢固件推进（实测无 diff 的 5x 每帧全刷会把 IPS 压到 11 万、
+ * 启动 >3min；加 diff 后 3x/4x 均 82s，本版验证 5x+diff）。
+ * 变化时每行先在内部 SRAM 的 s_row 展开 240→1200，再 memcpy 5 行到 PSRAM。 */
 static void render_frame()
 {
-    const uint64_t t0 = esp_timer_get_time();
+    const size_t frame_px = NP560_LCD_WIDTH * NP560_LCD_HEIGHT;
     np560_lcd_render(&s_periph.lcd, s_frame, NP560_LCD_WIDTH);
-    s_render_calls++;
-
-    unsigned run_start = 0;
-    unsigned run_len = 0;
-    unsigned dirty_rows = 0;
-
-    /* 放大一段连续脏源行，并只失效该段对应的 canvas 条带。
-     * 行先在内部 SRAM 的 s_row 展开 240→1200，再 memcpy 5 行到 PSRAM。 */
-    auto flush_run = [&]() {
-        for (unsigned y = run_start; y < run_start + run_len; y++) {
-            const uint16_t *src = s_frame + (size_t)y * NP560_LCD_WIDTH;
-            for (unsigned x = 0; x < NP560_LCD_WIDTH; x++) {
-                uint16_t c = src[x];
-                uint16_t *d = s_row + x * LCD_SCALE;
-                for (unsigned k = 0; k < LCD_SCALE; k++) {
-                    d[k] = c;
-                }
-            }
-            uint16_t *dst = s_canvas_buf + (size_t)y * LCD_SCALE * CANVAS_W;
-            for (unsigned k = 0; k < LCD_SCALE; k++) {
-                memcpy(dst + (size_t)k * CANVAS_W, s_row, CANVAS_W * sizeof(uint16_t));
-            }
-        }
-        lv_area_t area;
-        area.x1 = 0;
-        area.y1 = (lv_coord_t)(run_start * LCD_SCALE);
-        area.x2 = (lv_coord_t)(CANVAS_W - 1);
-        area.y2 = (lv_coord_t)((run_start + run_len) * LCD_SCALE - 1);
-        lv_obj_invalidate_area(s_canvas, &area);
-        s_render_dirty_runs++;
-    };
+    if (memcmp(s_frame, s_prev_frame, frame_px * sizeof(uint16_t)) == 0) {
+        return; /* 无变化：跳过放大与 LVGL 重绘 */
+    }
+    memcpy(s_prev_frame, s_frame, frame_px * sizeof(uint16_t));
 
     for (unsigned y = 0; y < NP560_LCD_HEIGHT; y++) {
-        uint16_t *src = s_frame + (size_t)y * NP560_LCD_WIDTH;
-        uint16_t *prev = s_prev_frame + (size_t)y * NP560_LCD_WIDTH;
-        if (memcmp(src, prev, NP560_LCD_WIDTH * sizeof(uint16_t)) == 0) {
-            if (run_len) {
-                flush_run();
-                run_len = 0;
+        const uint16_t *src = s_frame + (size_t)y * NP560_LCD_WIDTH;
+        for (unsigned x = 0; x < NP560_LCD_WIDTH; x++) {
+            uint16_t c = src[x];
+            uint16_t *d = s_row + x * LCD_SCALE;
+            for (unsigned k = 0; k < LCD_SCALE; k++) {
+                d[k] = c;
             }
-            continue;
         }
-        if (!run_len) {
-            run_start = y;
-        }
-        run_len++;
-        dirty_rows++;
-        memcpy(prev, src, NP560_LCD_WIDTH * sizeof(uint16_t));
-    }
-    if (run_len) {
-        flush_run();
-    }
-
-    if (dirty_rows) {
-        s_render_changed++;
-        s_render_dirty_rows += dirty_rows;
-        if (dirty_rows > s_render_max_dirty_rows) {
-            s_render_max_dirty_rows = dirty_rows;
+        uint16_t *dst = s_canvas_buf + (size_t)y * LCD_SCALE * CANVAS_W;
+        for (unsigned k = 0; k < LCD_SCALE; k++) {
+            memcpy(dst + (size_t)k * CANVAS_W, s_row, CANVAS_W * sizeof(uint16_t));
         }
     }
-    const uint64_t elapsed = esp_timer_get_time() - t0;
-    s_render_us_total += elapsed;
-    if (elapsed > s_render_us_max) {
-        s_render_us_max = elapsed;
-    }
+    lv_obj_invalidate(s_canvas);
 }
 
 static void emulator_task(void *arg)
@@ -252,30 +198,6 @@ static void emulator_task(void *arg)
                      (int)dmcu_irq_or_dtu_pending(&s_cpu),
                      (int)s_cpu.in_interrupt,
                      (unsigned)s_cpu.unsupported_count);
-            /* P0 显示统计：changed/calls 为实际发生变化的渲染帧比例，
-             * dirty_avg 是平均每帧变化的源行数（满屏为 120），runs 为合并后
-             * 的连续脏段数；us_avg/us_max 是 render_frame 自身耗时。 */
-            ESP_LOGI(TAG,
-                     "render: changed=%llu/%llu dirty_avg=%u max=%u "
-                     "runs=%llu us_avg=%llu us_max=%llu",
-                     (unsigned long long)s_render_changed,
-                     (unsigned long long)s_render_calls,
-                     (unsigned)(s_render_changed
-                                    ? s_render_dirty_rows / s_render_changed
-                                    : 0),
-                     (unsigned)s_render_max_dirty_rows,
-                     (unsigned long long)s_render_dirty_runs,
-                     (unsigned long long)(s_render_calls
-                                              ? s_render_us_total / s_render_calls
-                                              : 0),
-                     (unsigned long long)s_render_us_max);
-            s_render_calls = 0;
-            s_render_changed = 0;
-            s_render_dirty_rows = 0;
-            s_render_dirty_runs = 0;
-            s_render_max_dirty_rows = 0;
-            s_render_us_total = 0;
-            s_render_us_max = 0;
             last_report = now;
             burst_insns = 0;
             /* NAND 介质统计：确认页编程/擦除不再阻塞 CPU。 */
