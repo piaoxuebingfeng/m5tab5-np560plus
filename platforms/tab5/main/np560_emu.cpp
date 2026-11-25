@@ -2,7 +2,7 @@
  * np560_emu.cpp - NP560+ 模拟器 Tab5 宿主实现。
  *
  * 显示：ST7529 可见面 240x120（5 级灰度浓度）-> RGB565 -> LVGL9 canvas
- *       （5x 最近邻放大到 1200x600 居中；np560_lcd_render 含 COMSCN/
+ *       （3x 最近邻放大到 720x360 居中；np560_lcd_render 含 COMSCN/
  *        模块接线/部分显示语义。仅当源帧内容变化时才放大+invalidate，
  *        静止界面零渲染开销——避免拖慢固件启动）
  * 输入：Tab5 物理键盘桥（I2C 0x6D）-> NP560 矩阵；TODO 触摸皮肤
@@ -33,16 +33,16 @@
 
 static const char *TAG = "np560";
 
-#define LCD_SCALE     5u
-#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)   /* 1200 */
-#define CANVAS_H      (NP560_LCD_HEIGHT * LCD_SCALE)  /* 600 */
+#define LCD_SCALE     3u
+#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)   /* 720 */
+#define CANVAS_H      (NP560_LCD_HEIGHT * LCD_SCALE)  /* 360 */
 
 static Np560Bus *s_bus;
 static DMCUCpu s_cpu;
 static Np560Periph s_periph;
 static lv_obj_t *s_canvas;
 static lv_image_dsc_t s_canvas_img;
-/* RGB565 canvas（放大后 1200x600 = 1.4MB）放 PSRAM；面板源帧 240x120
+/* RGB565 canvas（放大后 720x360 = 0.5MB）放 PSRAM；面板源帧 240x120
  * 与上一帧副本放 PSRAM 用于变化检测；行展开缓冲放内部 SRAM。 */
 static uint16_t *s_canvas_buf;
 static uint16_t *s_frame;
@@ -74,12 +74,12 @@ static bool alloc_framebuffers()
     return true;
 }
 
-/* ST7529 可见面 -> RGB565 源帧 -> 5x 最近邻放大到 canvas。
+/* ST7529 可见面 -> RGB565 源帧 -> 3x 最近邻放大到 canvas。
  * 关键：源帧内容未变时直接返回，不做放大/memcpy/invalidate。NP560 界面
  * 大部分时间静止（桌面/菜单），启动期固件也常在等待，静止帧零开销，
- * 避免渲染拖慢固件推进（实测无 diff 的 5x 每帧全刷会把 IPS 压到 11 万、
- * 启动 >3min；加 diff 后 3x/4x 均 82s，本版验证 5x+diff）。
- * 变化时每行先在内部 SRAM 的 s_row 展开 240→1200，再 memcpy 5 行到 PSRAM。 */
+ * 避免渲染拖慢固件推进（历史实测：无 diff 的 5x 每帧全刷会把 IPS 压到
+ * 11 万、启动 >3min；加 diff 后 3x/4x 均 82s。本版为 3x+diff）。
+ * 变化时每行先在内部 SRAM 的 s_row 展开 240→720，再 memcpy 3 行到 PSRAM。 */
 static void render_frame()
 {
     const size_t frame_px = NP560_LCD_WIDTH * NP560_LCD_HEIGHT;
@@ -368,7 +368,7 @@ void np560_emu_start()
             np560_sd_attach_nand(&s_periph.nand);
         }
     }
-    /* 放大 canvas(1.4MB) 必须在固件装载之后分配：装载 resident.bin 需要
+    /* 放大 canvas(0.5MB) 必须在固件装载之后分配：装载 resident.bin 需要
      * 连续 PSRAM，提前占用会让 fread 失败（实测读 resident.bin failed）。 */
     if (!alloc_framebuffers()) {
         return;
@@ -404,7 +404,7 @@ void np560_emu_start()
     s_canvas = lv_canvas_create(lv_scr_act());
     lv_canvas_set_buffer(s_canvas, s_canvas_buf, CANVAS_W, CANVAS_H,
                          LV_COLOR_FORMAT_RGB565);
-    /* canvas 缓冲本身已是放大后的 1200x600，居中于 1280x720 屏幕。 */
+    /* canvas 缓冲本身已是放大后的 720x360，居中于 1280x720 屏幕。 */
     lv_obj_center(s_canvas);
     memset(s_canvas_buf, 0, CANVAS_W * CANVAS_H * sizeof(uint16_t));
     render_frame();
