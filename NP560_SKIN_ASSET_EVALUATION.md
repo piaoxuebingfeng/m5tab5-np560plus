@@ -137,3 +137,76 @@
 - 用户是否希望保留键盘区域（全图）还是只取上半部分（推荐）。
 - 皮肤资源最终放 TF 卡还是编译进 Flash。
 - 是否需要把图片上的侧键做成触摸热区（需另做 indev 消费，属于独立功能）。
+
+---
+
+## 9. 屏幕上方图标（annunciator）实机调研与 Tab5 补全方案
+
+### 9.1 实际运行 QEMU 的观察结果
+
+启动 `np560_web.py --device device/device.json`（systemd-run 单元 `np560-web-ann`，已清理），从 `/api/display` 抓取真实数据并用 Python 复现 `app.js` 的绘制，证据图保存在本仓库 `tmp/qemu_lcd_annunciator.png` / `tmp/qemu_lcd_annunciator_4x.png`。
+
+- canvas 实际是 **240×132**：顶部 12 行是"自定义玻璃段码图标"区，主画面从 y=12 开始（240×120）。
+- 实机画面顶部可见：**6 个淡色方向图标**（未激活的 ghost 轮廓）+ **右上角电池图标**（当前 2 格）。
+- 实测 `lcd_annunciators`（base64，解码 60 字节 = 2 plane × 30 字节 = 240 bit × 2）：
+  - plane0：全空
+  - plane1：active bits = `[235, 236, 237, 238]` → 电池轮廓 + 电量格
+  - 6 个方向图标的 bit（133/150/163/179/196/211）均未激活，所以只显示淡色轮廓
+
+### 9.2 Web 端这一块的实现机制
+
+| 层 | 实现 |
+|---|---|
+| QEMU 导出 | `np560.c:9911 np560_get_lcd_annunciators()`：读 ST7529 GRAM 的 line `NP560_LCD_VISIBLE_LINE-1 = 19` 与 `NP560_LCD_VISIBLE_LINE+120 = 140`，对 x=0..239 取 `np560_st7529_output_level(lcd,x,line) > 0`，按小端 bit 打包成 60 字节 base64。**只读硬件状态，不合成图标语义、不计算电池数值** |
+| Web 解码 | `app.js:205 annunciatorActive(bytes,plane,bit)` 解 bit |
+| 6 个方向图标 | `app.js:214-221 statusArtwork[]`：bit 133/150/163/179/196/211，x=92/110/128/146/164/182，每个 8×9 像素点阵。注释明确这是"照片重建的轮廓"，bit 仍是 guest 原始输出。激活 → on 色 `#243126`；未激活 → ghost 色（`off*0.86 + on*0.14`，`#b7c8a1` 混 `#243126`） |
+| 电池图标 | `app.js:232-256 drawBatteryAnnunciator()`：bit 228/235 为轮廓，bit 224/230、234、232/236、225/238 为 4 级电量格；只从 guest 段码位绘制 |
+| 布局 | `drawFrame()` 先填 240×132 底色，主画面写到 `y+12`，最后 `drawAnnunciators()` 覆盖顶部 12 行 |
+
+### 9.3 Tab5 是否缺少这一部分
+
+**确实缺少，用户观察正确。**
+
+- `np560_lcd.c:484 np560_lcd_render()` 只遍历 `NP560_LCD_HEIGHT = 120` 行，输出 240×120，完全没有顶部 12 行图标区。
+- `np560_lcd.c:359` 留有注释"QEMU 侧 line>=140 的 status_write 诊断 trace 不移植"，说明段码路径当时被有意省略。
+- 因此 Tab5 屏幕上方一片空白，既没有方向图标也没有电池图标。
+
+### 9.4 好消息：Tab5 的数据是完备的
+
+- `Np560Lcd` 结构（`np560_lcd.h:45`）有 `gram[NP560_ST7529_RAM_LINES=160][255]`，**行 19 和行 140 都在其中**，段码状态已被完整记录。
+- `np560_lcd.c:268 st7529_output_level(lcd, segment, line)` 已实现 LI/CI/CLR 映射，且返回的是**原始 GRAM level**（不经过 `st7529_panel_darkness()`），与 QEMU annunciator 导出语义完全一致。
+- 结论：**不需要改 guest 固件、不需要额外采集硬件状态**，只需在 `np560_lcd.c` 内部新增一个导出函数（因为 `st7529_output_level` 是 static）：
+
+```c
+void np560_lcd_render_annunciators(const Np560Lcd *lcd,
+                                   uint16_t *out, unsigned out_stride);
+```
+
+按 QEMU 的两平面位表 + Web 的 6 个 artwork/电池位表，把 12 行 RGB565 写进 `out[0..11]`。
+
+### 9.5 结合上半部分皮肤的完整方案（不触碰三条安全不变量）
+
+目标：Tab5 上达到 Web 同等效果——机身皮肤 + 屏幕洞内"图标 + 主画面"，且不影响 NP560 系统屏幕与图标显示。
+
+1. **源帧升级**：`s_frame` 从 240×120 扩到 **240×132**；`np560_lcd_render()` 主画面写到 `out + 12*stride`；diff 检测范围同步扩到 240×132（图标变化也能触发刷新）。
+2. **图标渲染**：新增 `np560_lcd_render_annunciators()` 写 y=0..11，位表与形状直接照搬 Web（6 个方向图标 + 电池）。
+3. **放大**：canvas 从 720×360（3x×120）改为 **720×396（3x×132）**，宽不变、高 +36。
+4. **皮肤合成（沿用第 5 章方案 A）**：
+   - 1280×720 全屏 RGB565 canvas（约 1.84 MB PSRAM，resident.bin 装载**之后**分配）。
+   - 上半部分皮肤（裁 y≈780，1254×694）离线转 RGB565，等比缩放铺 1280 宽（约 1280×708，上下少量留边）；洞实测 x=349..930 / y=258..638，缩放后约 x=356..949 / y≈223..604。
+   - 把 720×396 的 NP560 画面按宽度适配贴入洞（约 593×326，上下留边，与 Web `object-fit` 行为一致）。
+   - **源帧有变化才整幅重建 + 整幅 invalidate**，绝不局部失效；不碰 `lv_display_set_rotation`、flush、draw buffer。
+5. **内存预算**：全屏 canvas 1.84 MB + 源帧/上一帧约 0.15 MB + 皮肤约 1.82 MB ≈ 3.8 MB，在 resident 装载后约 6 MB 连续 PSRAM 余量内；若紧张，皮肤可编译进 Flash 直接读。
+
+### 9.6 建议实施顺序（风险拆分，每步独立提交）
+
+1. **先只补图标**（最小、最安全）：把源帧扩到 240×132 + 新增 annunciator 渲染，先在现有"3x 居中 canvas"上验证图标出现、主画面完全不变。这一步可单独烧录对照，不涉及皮肤。
+2. **再做皮肤资源**：离线裁图/去绿/转 RGB565 + 静态坐标映射表核对（不烧录）。
+3. **最后全屏合成**：接皮肤 + 洞内画面，整幅合成，静态确认方向与边界后再真机验证。
+
+这样第 1 步单独就能解决"图标缺失"，且严格满足"不能影响 NP560 系统屏幕显示"的要求；皮肤叠加放在最后，出问题可独立回退。
+
+### 9.7 实机证据文件
+
+- `tmp/qemu_lcd_annunciator.png`：240×132 原始复现帧
+- `tmp/qemu_lcd_annunciator_4x.png`：4 倍最近邻放大，清晰可见顶部 6 个方向图标与电池图标
