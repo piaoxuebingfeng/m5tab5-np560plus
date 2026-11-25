@@ -2,7 +2,7 @@
 
 在 **M5Stack Tab5**（ESP32-P4）上以 **re-host** 方式运行诺亚舟 NP560+ 学习机固件的实验性移植。
 
-> 本仓库不是 QEMU 模拟器本体。DMCU 指令集与外设语义由独立的 QEMU 工程作为 oracle 参考，本仓库只包含面向 Tab5 的解释器、SoC 外设桥、皮肤资源与构建工具。
+> 本仓库不是 QEMU 模拟器本体。DMCU 指令集与外设语义由独立的 QEMU 工程作为 oracle 参考：[HelloClyde/np560-plus-emulator](https://github.com/HelloClyde/np560-plus-emulator.git)。本仓库只包含面向 Tab5 的解释器、SoC 外设桥、皮肤资源与构建工具。
 
 ## 当前状态
 
@@ -43,6 +43,7 @@ tools/                      皮肤生成、串口抓日志等辅助脚本
 - `$REPO_ROOT` = 本仓库根目录
 - `$IDF_PATH` = ESP-IDF 安装目录（本工程验证过 **v5.4.2**，不要用 v5.5.3）
 - `$PORT` = 设备串口（例如 `/dev/ttyACM0`）
+- `$ORACLE_ROOT` = 参考仓库 [np560-plus-emulator](https://github.com/HelloClyde/np560-plus-emulator.git) 的本地 clone 根目录（QEMU oracle，不随本仓库发布）
 
 ```bash
 source "$IDF_PATH/export.sh"
