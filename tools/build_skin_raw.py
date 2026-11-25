@@ -38,7 +38,10 @@ DEFAULT_OUT = ROOT / "app" / "assets" / "skin.raw"
 
 SRC_SIZE = (1254, 1254)
 CROP_TOP, CROP_BOTTOM = 86, 780          # -> 1254 x 694, near 16:9
-HOLE_X0, HOLE_Y0, HOLE_X1, HOLE_Y1 = 349, 258, 930, 638   # source-image coords
+# 真实透明洞：alpha<200 连通域 flood-fill 实测 x=337..931 / y=256..643，
+# 中心 634.0。旧值 349..930（文档估值）偏右 5.5px 且窄 13px，导致画面在洞内
+# 明显偏右、左侧露羽化边。以实测值为准。
+HOLE_X0, HOLE_Y0, HOLE_X1, HOLE_Y1 = 337, 256, 931, 643   # source-image coords
 HOLE_PAD = 6                             # cover the feathered hole edge
 GREEN_RING = 24                          # only clean chroma key near the hole
 GREEN_DELTA = 12                         # G > R+12 and G > B+12 => greenish
@@ -167,14 +170,51 @@ def build(src: Path, out: Path) -> dict:
     }
 
 
+def fit_to_screen(raw_path: Path, out_path: Path) -> dict:
+    """Offline-fixed scale: 1254x694 -> 1280x708, RGB565 LE -> RGB565 LE.
+
+    Decode to 8-bit RGB, resize once with LANCZOS (matches Web's smooth CSS
+    object-fit better than nearest neighbour), then quantise once to RGB565.
+    This output is immutable: step 3 memcpy's it into the full-screen canvas.
+    """
+    raw = np.fromfile(raw_path, dtype="<u2").reshape(694, 1254)
+    r5 = (raw >> 11) & 0x1F
+    g6 = (raw >> 5) & 0x3F
+    b5 = raw & 0x1F
+    rgb = np.stack([(r5 * 255 // 31), (g6 * 255 // 63), (b5 * 255 // 31)],
+                   axis=-1).astype(np.uint8)
+    fitted = np.asarray(
+        Image.fromarray(rgb, "RGB").resize((1280, 708), Image.Resampling.LANCZOS),
+        dtype=np.uint8,
+    )
+    rr = fitted[:, :, 0].astype(np.uint16)
+    gg = fitted[:, :, 1].astype(np.uint16)
+    bb = fitted[:, :, 2].astype(np.uint16)
+    pixels = ((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pixels.astype("<u2").tofile(out_path)
+    return {
+        "out": str(out_path),
+        "size": [1280, 708],
+        "out_bytes": out_path.stat().st_size,
+        "out_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", type=Path, default=DEFAULT_SRC)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--fit-to-screen", action="store_true",
+                    help="also emit the fixed 1280x708 RGB565 raw for step 3")
+    ap.add_argument("--fit-out", type=Path,
+                    default=ROOT / "app" / "assets" / "skin_screen.raw")
     ap.add_argument("--json", action="store_true", help="emit machine-readable report")
     args = ap.parse_args()
 
     report = build(args.src, args.out)
+    if args.fit_to_screen:
+        report["screen_fit"] = fit_to_screen(args.out, args.fit_out)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return
@@ -198,6 +238,13 @@ def main() -> None:
           f"{report['doc_old_frame_y']}) omitted crop offset 86; "
           f"correct values are {lay['hole_on_screen'][1]}/"
           f"{lay['frame_origin_on_screen'][1]}.")
+    if "screen_fit" in report:
+        fit = report["screen_fit"]
+        print("--- screen-fit raw (immutable, embedded in Flash) ---")
+        print(f"file          : {fit['out']}")
+        print(f"size          : {fit['size'][0]}x{fit['size'][1]} "
+              f"({fit['out_bytes']} bytes)")
+        print(f"sha256        : {fit['out_sha256']}")
 
 
 if __name__ == "__main__":

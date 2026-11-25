@@ -2,10 +2,13 @@
  * np560_emu.cpp - NP560+ 模拟器 Tab5 宿主实现。
  *
  * 显示：ST7529 可见面 240x120 + 顶部 12 行状态图标 = 240x132 源帧
- *       （5 级灰度浓度）-> RGB565 -> LVGL9 canvas（3x 最近邻放大到 720x396
- *        居中；np560_lcd_render 含 COMSCN/模块接线/部分显示语义。
- *        仅当源帧内容变化时才放大+invalidate，静止界面零渲染开销——
- *        避免拖慢固件启动。图标位来自 GRAM line19/140，与 QEMU Web 一致）
+ *       -> RGB565（Web 精确绿灰配色）-> 2.471x 最近邻贴入 1280x720 全屏
+ *       LVGL canvas 的皮肤屏幕洞 (356,212,593x326)。皮肤 1280x708 raw 固化
+ *       编译进 Flash，启动时 memcpy 到 canvas（0,6）；之后每帧只覆盖洞内画面
+ *       矩形，源帧无变化则整帧跳过。整幅 invalidate，不碰 rotation/flush，
+ *       保持 DISPLAY_FLUENCY_OPTIMIZATION.md 的三条安全不变量。
+ *       np560_lcd_render 含 COMSCN/模块接线/部分显示语义；图标位来自
+ *       GRAM line19/140，与 QEMU Web 一致。
  * 输入：Tab5 物理键盘桥（I2C 0x6D）-> NP560 矩阵；TODO 触摸皮肤
  * 存储：TF 卡 /sd/noahnp560/（用户约定：不放根目录）：
  *       NP560.PRG -> data 平面 0x30000（vma03）、resident.bin -> code ROM
@@ -21,6 +24,7 @@
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
+#include "esp_partition.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
 #include "dmcu_bus.h"
@@ -34,22 +38,38 @@
 
 static const char *TAG = "np560";
 
-#define LCD_SCALE     3u
-#define CANVAS_W      (NP560_LCD_WIDTH * LCD_SCALE)          /* 720 */
-#define CANVAS_H      (NP560_LCD_FRAME_HEIGHT * LCD_SCALE)   /* 396 = 132*3 */
+/* 全屏合成（第③步）：LVGL 逻辑屏 1280x720，皮肤固化 1280x708 @ (0,6)。
+ * 洞内画面按宽 593/240 = 2.471x 贴入，与 Web .lcd-window object-fit 语义一致。
+ * 这些常量来自 tools/build_skin_raw.py 的静态坐标核对（已修正 CROP_TOP=86）。 */
+#define CANVAS_W      1280u
+#define CANVAS_H      720u
+#define SKIN_W        1280u
+#define SKIN_H        708u
+#define SKIN_Y        6u              /* (720-708)/2 */
+/* 洞坐标来自真实透明连通域（alpha<200 flood fill）实测，非文档估值：
+ * 源图 x=337..931 / y=256..643，中心 634（略偏右是 Web 原图事实）。
+ * 落屏洞 x=343.99..950.30 / y=179.33..574.35；画面按宽适配 2.5263x。 */
+#define FRAME_X       344u
+#define FRAME_Y       210u
+#define FRAME_W       606u            /* 240 * 2.526 */
+#define FRAME_H       333u            /* 132 * 2.526 */
+
+/* 固化皮肤放在独立 data 分区（np560skin, subtype 0x40），用 esp_partition_read
+ * 直接读，不经过 .drom->PSRAM XIP 映射——否则 1.73MB 会吃掉 resident.bin
+ * 装载所需的连续 PSRAM（实测 largest 6.55MB->4.72MB 导致 fread 失败）。 */
+#define SKIN_PARTITION_NAME "np560skin"
 
 static Np560Bus *s_bus;
 static DMCUCpu s_cpu;
 static Np560Periph s_periph;
 static lv_obj_t *s_canvas;
 static lv_image_dsc_t s_canvas_img;
-/* RGB565 canvas（放大后 720x396 = 0.56MB）放 PSRAM；源帧 240x132
- * （顶部 12 行状态图标 + 240x120 主画面）与上一帧副本放 PSRAM 用于变化检测；
- * 行展开缓冲放内部 SRAM。 */
+/* RGB565 全屏 canvas（1280x720 = 1.76MB）放 PSRAM；源帧 240x132
+ * （顶部 12 行状态图标 + 240x120 主画面）与上一帧副本放 PSRAM 用于变化检测。
+ * 皮肤 raw 常驻 Flash（1.73MB），只在启动时铺一次，之后画布洞外区域不再改动。 */
 static uint16_t *s_canvas_buf;
 static uint16_t *s_frame;
 static uint16_t *s_prev_frame;
-static DRAM_ATTR uint16_t s_row[CANVAS_W];  /* 一行放大像素，内部 SRAM */
 
 /* PSRAM 大缓冲分配（启动早期调用）。失败返回 false。 */
 static bool alloc_framebuffers()
@@ -78,6 +98,44 @@ static bool alloc_framebuffers()
     return true;
 }
 
+/* 启动时从独立 Flash 分区读取固化皮肤铺到全屏 canvas（0,6）。用分区首部的
+ * 16B 头校验尺寸（magic 'NP560SKN' + w/h），再逐行读；整幅只读一次，之后
+ * 皮肤区不再改动。必须先在 alloc_framebuffers 之后执行（resident 已装载）。 */
+static void paint_skin_background()
+{
+    const esp_partition_t *part =
+        esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                 (esp_partition_subtype_t)0x40, SKIN_PARTITION_NAME);
+    if (!part) {
+        ESP_LOGE(TAG, "skin partition '%s' not found", SKIN_PARTITION_NAME);
+        return;
+    }
+    uint8_t hdr[16];
+    if (esp_partition_read(part, 0, hdr, sizeof(hdr)) != ESP_OK ||
+        memcmp(hdr, "NP560SKN", 8) != 0) {
+        ESP_LOGE(TAG, "skin partition header invalid");
+        return;
+    }
+    uint32_t sw = hdr[8] | (hdr[9] << 8) | (hdr[10] << 16) | (hdr[11] << 24);
+    uint32_t sh = hdr[12] | (hdr[13] << 8) | (hdr[14] << 16) | (hdr[15] << 24);
+    if (sw != SKIN_W || sh != SKIN_H) {
+        ESP_LOGE(TAG, "skin size mismatch: %ux%u (want %ux%u)",
+                 (unsigned)sw, (unsigned)sh, SKIN_W, SKIN_H);
+        return;
+    }
+    for (unsigned y = 0; y < SKIN_H; y++) {
+        if (esp_partition_read(part, 16 + (size_t)y * SKIN_W * sizeof(uint16_t),
+                               s_canvas_buf + (size_t)(SKIN_Y + y) * CANVAS_W,
+                               SKIN_W * sizeof(uint16_t)) != ESP_OK) {
+            ESP_LOGE(TAG, "skin read row %u failed", y);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "skin painted: %ux%u from partition '%s' (%u KB)",
+             SKIN_W, SKIN_H, SKIN_PARTITION_NAME,
+             (unsigned)(SKIN_W * SKIN_H * 2u / 1024u));
+}
+
 /* 状态图标点阵：逐点复刻 QEMU Web app.js 的 statusArtwork（8 行 × 9 列）。
  * bit 是 plane1 的位号，x 是 240 宽源帧起点。只按 guest 导出的电极位决定
  * 激活/淡显，不合成图标语义；形状/位置取自实机照片，与 Web 保持一致。 */
@@ -102,11 +160,14 @@ static const AnnunciatorArtwork s_ann_art[] = {
                   "000111000", "000010000", "000000000", "000000000" } },
 };
 
-static uint16_t ann_gray565(unsigned bright)
-{
-    return (uint16_t)(((bright >> 3) << 11) | ((bright >> 2) << 5) |
-                      (bright >> 3));
-}
+/* Web 精确配色常量（app.js colors() + drawAnnunciators()）：
+ *   off = #b7c8a1 -> 0xb654（洞内熄灭色/图标背景）
+ *   on  = #243126 -> 0x2184（激活图标/文字最深色）
+ *   ghost = off*0.86 + on*0.14 = rgb(162,179,144) -> 0xa592
+ * 统一后主画面底色与洞内留白一致，无绿色/白色色差。 */
+#define LCD_OFF_RGB565   0xb654u
+#define LCD_ON_RGB565    0x2184u
+#define ANN_GHOST_RGB565 0xa592u
 
 static bool ann_bit(const uint8_t *planes, unsigned bit)
 {
@@ -124,14 +185,14 @@ static void ann_fill(uint16_t *frame, unsigned x, unsigned y,
     }
 }
 
-/* 图标色阶沿用 Tab5 主画面的白底/黑字灰阶，避免与 240x120 主画面配色冲突；
- * 未激活轮廓对应 Web 的 off*0.86+on*0.14（亮度 219）。 */
+/* 图标配色与 Web 完全一致：背景 off、激活 on、未激活 ghost；
+ * 主画面也走同一组 off/on 插值（np560_lcd_render 的 web_gray5 表）。 */
 static void draw_annunciators(uint16_t *frame)
 {
     uint8_t planes[NP560_LCD_ANNUNCIATOR_BYTES];
-    const uint16_t bg = 0xffffu;
-    const uint16_t active = 0x0000u;
-    const uint16_t ghost = ann_gray565(219u);
+    const uint16_t bg = LCD_OFF_RGB565;
+    const uint16_t active = LCD_ON_RGB565;
+    const uint16_t ghost = ANN_GHOST_RGB565;
 
     np560_lcd_annunciators(&s_periph.lcd, planes);
     ann_fill(frame, 0, 0, NP560_LCD_WIDTH, NP560_LCD_ANNUNCIATOR_HEIGHT, bg);
@@ -168,10 +229,11 @@ static void draw_annunciators(uint16_t *frame)
     }
 }
 
-/* ST7529 -> 240x132 源帧（顶部 12 行图标 + 120 行主画面）-> 3x 放大到 canvas。
- * 关键：源帧内容未变时直接返回，不做放大/memcpy/invalidate。静止帧零开销。
- * 主画面写入 s_frame+12 行，与 Web 的 annunciatorHeight=12 偏移一致；
- * 放大循环/invalidate 语义不变，仍是整幅覆盖（三条安全不变量之一）。 */
+/* ST7529 -> 240x132 源帧（顶部 12 行图标 + 120 行主画面）-> 2.471x 最近邻
+ * 贴入全屏 canvas 的洞内矩形 (356,212,593x326)。皮肤在启动时已铺好，洞内
+ * 上下 30.85px 留白仍是皮肤预填的熄灭色 0xb654，与 Web 的 object-fit 一致。
+ * 关键：源帧未变时整帧跳过；变化时只覆写洞内矩形（皮肤其余部分不动），
+ * 但 invalidate 仍是整幅——不碰 rotation/flush，保持三条安全不变量。 */
 static void render_frame()
 {
     const size_t frame_px = NP560_LCD_WIDTH * NP560_LCD_FRAME_HEIGHT;
@@ -184,18 +246,15 @@ static void render_frame()
     }
     memcpy(s_prev_frame, s_frame, frame_px * sizeof(uint16_t));
 
-    for (unsigned y = 0; y < NP560_LCD_FRAME_HEIGHT; y++) {
-        const uint16_t *src = s_frame + (size_t)y * NP560_LCD_WIDTH;
-        for (unsigned x = 0; x < NP560_LCD_WIDTH; x++) {
-            uint16_t c = src[x];
-            uint16_t *d = s_row + x * LCD_SCALE;
-            for (unsigned k = 0; k < LCD_SCALE; k++) {
-                d[k] = c;
-            }
-        }
-        uint16_t *dst = s_canvas_buf + (size_t)y * LCD_SCALE * CANVAS_W;
-        for (unsigned k = 0; k < LCD_SCALE; k++) {
-            memcpy(dst + (size_t)k * CANVAS_W, s_row, CANVAS_W * sizeof(uint16_t));
+    /* 非整数倍最近邻：dst_x 映射到 src_x = dst_x*240/593（Web 同为
+     * 非整数倍，2323 交替的轻微不均是既有视觉基线）。 */
+    for (unsigned dy = 0; dy < FRAME_H; dy++) {
+        unsigned sy = (unsigned)((uint64_t)dy * NP560_LCD_FRAME_HEIGHT / FRAME_H);
+        const uint16_t *src = s_frame + (size_t)sy * NP560_LCD_WIDTH;
+        uint16_t *dst = s_canvas_buf + (size_t)(FRAME_Y + dy) * CANVAS_W + FRAME_X;
+        for (unsigned dx = 0; dx < FRAME_W; dx++) {
+            unsigned sx = (unsigned)((uint64_t)dx * NP560_LCD_WIDTH / FRAME_W);
+            dst[dx] = src[sx];
         }
     }
     lv_obj_invalidate(s_canvas);
@@ -459,15 +518,19 @@ void np560_emu_start()
     bool firmware_ok = false;
     if (np560_sd_mount()) {
         firmware_ok = np560_sd_load_firmware(s_bus);
-        if (firmware_ok) {
-            np560_sd_attach_nand(&s_periph.nand);
-        }
     }
-    /* 放大 canvas(0.5MB) 必须在固件装载之后分配：装载 resident.bin 需要
-     * 连续 PSRAM，提前占用会让 fread 失败（实测读 resident.bin failed）。 */
+    /* 全屏 canvas(1.76MB) 必须在固件装载之后、NAND attach 之前分配：
+     * ① 装载 resident.bin 需要连续 PSRAM，提前占用会让 fread 失败；
+     * ② NAND OOB 稀疏索引另占 1.67MB，若先 attach 会让剩余连续块不足
+     *    1.76MB 导致 canvas 分配失败。CPU 任务在函数末尾才创建，NAND
+     *    延后到此处 attach 不影响启动。 */
     if (!alloc_framebuffers()) {
         return;
     }
+    if (firmware_ok) {
+        np560_sd_attach_nand(&s_periph.nand);
+    }
+    paint_skin_background();
     if (firmware_ok) {
         /* 固件装载后重设复位向量（cpu_reset 初次调用时 code_rom 尚未
          * 装载，PC 兜底在 0x200000）。不能重复整个 cpu_reset：其 memset
@@ -486,7 +549,8 @@ void np560_emu_start()
     /* Tab5 物理键盘桥：I2C 事件 -> NP560 矩阵（未插键盘则后台周期重试）。 */
     np560_tab5_keyboard_start(&s_periph);
 
-    /* 全屏 LVGL canvas：HAL 已启动 LVGL（hal_esp32.cpp display init）。 */
+    /* 全屏 LVGL canvas：HAL 已启动 LVGL（hal_esp32.cpp display init）。
+     * 皮肤已在 paint_skin_background() 铺入 buffer，此处只建对象、不 memset。 */
     memset(&s_canvas_img, 0, sizeof(s_canvas_img));
     s_canvas_img.header.cf = LV_COLOR_FORMAT_RGB565;
     s_canvas_img.header.w = CANVAS_W;
@@ -499,9 +563,8 @@ void np560_emu_start()
     s_canvas = lv_canvas_create(lv_scr_act());
     lv_canvas_set_buffer(s_canvas, s_canvas_buf, CANVAS_W, CANVAS_H,
                          LV_COLOR_FORMAT_RGB565);
-    /* canvas 缓冲本身已是放大后的 720x396，居中于 1280x720 屏幕。 */
-    lv_obj_center(s_canvas);
-    memset(s_canvas_buf, 0, CANVAS_W * CANVAS_H * sizeof(uint16_t));
+    /* canvas 缓冲即 1280x720 全屏，铺满逻辑屏（不再居中留黑边）。 */
+    lv_obj_set_pos(s_canvas, 0, 0);
     render_frame();
     bsp_display_unlock();
 

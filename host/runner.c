@@ -844,14 +844,15 @@ static void test_k(void)
     np560_lcd_command(&lcd, 0xaf);
     check("K DISON restores", np560_lcd_visible_level(&lcd, 0, 0), 31);
 
-    /* 渲染方向：浓度 31=满驱动=黑 → RGB565 0x0000；浓度 0=无驱动=白 → 0xFFFF。
-     * 与 QEMU Web app.js（value 越大越接近深色 on）一致；防止误改回反色。 */
+    /* 渲染方向/配色：精确复刻 QEMU Web app.js drawFrame() 的绿灰插值。
+     * 浓度 31=满驱动 → on=#243126 → 0x2184；浓度 0=无驱动 → off=#b7c8a1
+     * → 0xb654（即皮肤洞内熄灭色）。防止误改回纯灰阶白/黑导致色差。 */
     {
         uint16_t px[4]; /* stride=2，只需 (0,0)/(1,0) 两列。 */
 
         np560_lcd_render(&lcd, px, 2);
-        check("K render dark pixel black", px[0], 0x0000);
-        check("K render light pixel white", px[1], 0xffff);
+        check("K render dark pixel on", px[0], 0x2184);
+        check("K render light pixel off", px[1], 0xb654);
     }
 
     /* 状态电极导出：对齐 QEMU np560_get_lcd_annunciators。

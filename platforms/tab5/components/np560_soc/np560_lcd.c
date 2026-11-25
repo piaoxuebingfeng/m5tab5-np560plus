@@ -483,22 +483,25 @@ uint8_t np560_lcd_status_read(const Np560Lcd *lcd)
 
 void np560_lcd_render(const Np560Lcd *lcd, uint16_t *out, unsigned out_stride)
 {
+    /* 32 级灰阶 RGB565 查表，精确复刻 QEMU Web app.js drawFrame()：
+     *   color = round(off + (on - off) * darkness / 31)
+     *   off = #b7c8a1 (lcd-off), on = #243126 (lcd-on)
+     * 之前用纯灰阶 bright=31-darkness（白→黑），与 Web 的绿灰配色不符，
+     * 全屏皮肤合成后洞内留白（0xb654）会与画面底色出现明显色差。
+     * 表由 tools/ 的 Python 计算生成，逐项对齐 Web 的 Math.round。 */
+    static const uint16_t web_gray5[32] = {
+        0xb654, 0xb613, 0xadf3, 0xadd2, 0xa5b2, 0x9d91, 0x9d51, 0x9530,
+        0x9510, 0x8cef, 0x8caf, 0x848e, 0x7c6e, 0x7c4d, 0x742d, 0x73ec,
+        0x6bcc, 0x63ab, 0x638b, 0x5b4a, 0x5b2a, 0x5309, 0x4ae9, 0x4ac8,
+        0x4288, 0x4267, 0x3a47, 0x3226, 0x3206, 0x29c5, 0x29a5, 0x2184,
+    };
     unsigned x, y;
 
     for (y = 0; y < NP560_LCD_HEIGHT; y++) {
         for (x = 0; x < NP560_LCD_WIDTH && x < out_stride; x++) {
             unsigned darkness = st7529_visible_level(lcd, x, y);
-            /* 光学浓度 0..31（0=无驱动=亮/白，31=满驱动=暗/黑）转亮度：
-             * 浓度越大越暗，故取 31-darkness。与 QEMU Web app.js 一致
-             * （value=0→off 浅色，value=31→on 深色）；写成 darkness 会
-             * 整幅反色（白底黑字变黑底白字）。 */
-            unsigned bright = (31u - darkness) * 255u / 31u;
-            uint16_t r = (uint16_t)(bright >> 3);
-            uint16_t g = (uint16_t)(bright >> 2);
-            uint16_t b = (uint16_t)(bright >> 3);
-
-            out[(size_t)y * out_stride + x] =
-                (uint16_t)((r << 11) | (g << 5) | b);
+            if (darkness > 31u) darkness = 31u;
+            out[(size_t)y * out_stride + x] = web_gray5[darkness];
         }
     }
 }

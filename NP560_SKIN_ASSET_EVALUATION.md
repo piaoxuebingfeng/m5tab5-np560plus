@@ -359,3 +359,39 @@ Tab5 的 **593×326 / 上下留 30.9 px** 与 Web 的 **581×319.5 / 上下留 3
 3. **缩放实现**：皮肤 1254×694 → 1280×708 的缩放可在离线阶段固化（改成直接输出 1280×708 raw），也可在运行时做；前者省运行时算力但改本步产出，需用户确认后再动。
 4. 触摸热区仍是 TODO，不影响显示链路。
 5. 本步**未编译、未烧录、未改任何固件代码**；按用户约定需先确认真机顶部图标（第①步）后才进入第三步。
+
+---
+
+## 13. 第③步执行结果：全屏合成（2026-11-25，已真机验证）
+
+用户确认：第①步真机图标正常、同意统一底色为 `0xb654`、Flash 容量充足则编译进 Flash、缩放固化。本步实现并烧录验证通过。
+
+### 13.1 最终实现
+
+| 项 | 实现 |
+|---|---|
+| 皮肤资源 | `app/assets/skin_screen.raw`（1280×708 RGB565 LE，1,812,480 B，SHA=`c4aaa7bb…e1f5`），经 `--fit-to-screen` 从原始 PNG 一次 LANCZOS 缩放+量化固化 |
+| 皮肤存放 | **独立 Flash 分区** `np560skin`（type=data, subtype=0x40, 2MB, offset `0xc74000`），镜像 `platforms/tab5/skin_part.bin` = 16B 头（`NP560SKN`+w/h）+ raw；运行时 `esp_partition_read` 逐行读 |
+| 主画面配色 | `np560_lcd_render()` 改 32 级查表，精确复刻 Web `off=#b7c8a1(0xb654)` → `on=#243126(0x2184)` 的 `Math.round` 插值；图标 bg/on/ghost 同步为 `0xb654/0x2184/0xa592` |
+| 合成 | 全屏 canvas 1280×720 @(0,0)；皮肤铺 (0,6)；240×132 源帧按 **2.5263x** 最近邻贴入洞口矩形 (344,210,606×333)；仅洞内矩形被逐帧覆写，仍是**整幅 invalidate**，不碰 rotation/flush/draw buffer |
+| 内存顺序 | `alloc_framebuffers()` 提到 `np560_sd_attach_nand()` **之前**：先给 canvas 1.76MB 连续块，NAND OOB 索引(1.67MB)随后用剩余空间；CPU 任务在函数末尾才创建，不受影响 |
+
+### 13.2 两个真机根因（都非显示代码本身）
+
+1. **EMBED_TXTFILES 皮肤吃 PSRAM**：工程 `CONFIG_SPIRAM_XIP_FROM_PSRAM=y`，EMBED_TXTFILES 的皮肤 raw 落在 `.drom`（map: `0x48178c88`）被 XIP 映射到 PSRAM。实测 `psram largest` 从 6.55MB 降到 4.72MB，`resident.bin`（2MB）malloc 失败 → 停在 smoke test。**改用独立分区 + `esp_partition_read`** 后恢复 6.55MB，固件正常装载。
+2. **几何偏差（用户目视发现）**：文档估值洞 `x=349..930` 偏右且偏窄。用 alpha<200 flood-fill 实测真实洞 `x=337..931 / y=256..643`、中心 634；旧填色矩形未覆盖左侧 337..342 的羽化区，画面在洞内明显偏右、左宽右窄。改用实测洞后画面 (344..950) 与洞 (344..950) 水平重合、上下各留 31px，静态预览 `/tmp/skin_geom_check.png` 核对通过。
+
+### 13.3 真机验证数据
+
+- 编译：app bin 2.76MB（皮肤不再嵌入），app 分区余 74%；host 回归全通过（含新配色断言 `0x2184/0xb654`）。
+- 烧录：3 次（首次 EMBED_TXTFILES 版失败已废弃 → 分区版 → 几何修正版），最终 app + 皮肤分区 Hash verified。
+- 启动日志：`firmware loaded: PRG 4096KB / ROM 2046KB` → `skin painted: 1280x708 from partition 'np560skin' (1770 KB)` → `reset PC=0x30000` → `keyboard ready` → `emulator task start`，无 abort/Guru/assert。
+- 性能：启动早期（NAND 扫描）IPS 15~35 万属暂态；进桌面后稳定 **1,332,000~1,334,000**，与第①步基线 131 万一致，**无退化**。
+
+### 13.4 烧录注意
+
+皮肤分区是新增分区，需单独烧：`esptool write_flash 0xc74000 platforms/tab5/skin_part.bin`（或 `idf.py flash` 后补此步）。分区表改动不影响 TF 卡数据（SD 走 /sd/noahnp560/）。
+
+### 13.5 未决
+
+触摸热区仍是 TODO（点皮肤上的按键不生效），属独立功能，不影响本步显示链路。
