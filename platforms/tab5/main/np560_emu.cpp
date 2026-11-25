@@ -528,14 +528,16 @@ void np560_emu_start()
         firmware_ok = np560_sd_load_firmware(s_bus);
     }
     /* QEMU 在每条指令前调用 rom_service 拦截 01/02 ROM 洞里的 MP3 门
-     * (TRAP#0 + "MPLH")。Tab5 解释器原本只覆盖远调用 HLE，进 MP3 会
-     * 在 01:0000 向量无限自陷，触摸/物理按键全部失去响应。 */
+     * (TRAP#0 + "MPLH")。6 个门的真正基址是 0x21E26（QEMU 配置的
+     * rom_mp3_hle_base=138790）；0x21E66 只是第 4 号门，不能当基址。
+     * Tab5 解释器原本只覆盖远调用 HLE，进 MP3 会在 01:0000 向量
+     * 无限自陷，触摸/物理按键全部失去响应。 */
     if (firmware_ok) {
-        s_mp3_hle = np560_mp3_hle_tab5_create(s_bus, 0x21e66u);
+        s_mp3_hle = np560_mp3_hle_tab5_create(s_bus, 0x21e26u);
         if (s_mp3_hle) {
             s_bus->rom_service = np560_mp3_hle_tab5_service;
             s_bus->rom_service_user = s_mp3_hle;
-            ESP_LOGI(TAG, "MP3 HLE gate ready @0x21e66");
+            ESP_LOGI(TAG, "MP3 HLE gate ready @0x21e26");
         } else {
             ESP_LOGW(TAG, "MP3 HLE gate marker absent; TRAP path unchanged");
         }

@@ -1465,7 +1465,7 @@ static void test_p(void)
     for (service = 0; service < 6; service++) {
         for (i = 0; i < 8; i++) {
             uint16_t word = marker[i];
-            uint32_t at = 0x21e66u + 16u * service + 2u * i;
+            uint32_t at = 0x21e26u + 16u * service + 2u * i;
             if (i == 5) {
                 word = (uint16_t)service;
             }
@@ -1475,18 +1475,18 @@ static void test_p(void)
     }
     np560_bus_take_code_rom(bus, rom, 0x30000);
 
-    hle = np560_mp3_hle_tab5_create(bus, 0x21e66u);
+    hle = np560_mp3_hle_tab5_create(bus, 0x21e26u);
     check("P gate marker accepted", hle != NULL, 1);
     bus->rom_service = np560_mp3_hle_tab5_service;
     bus->rom_service_user = hle;
 
     memset(&cpu, 0, sizeof(cpu));
-    cpu.pc = 0x21e66u;
+    cpu.pc = 0x21e26u;
     cpu.sfr[DMCU_SFR_DS0] = 0xa2u;      /* workspace = 0x510000 (0xa2<<15) */
     cpu.gpr[3] = 0;
     dmcu_exec_step(bus, &cpu);
     /* TRAP 被服务：顺序后继是门内的 RETS-far，没有进入 01:0000 向量。 */
-    check("P gate skips TRAP", cpu.pc, 0x21e68u);
+    check("P gate skips TRAP", cpu.pc, 0x21e28u);
     check("P gate serviced once", (uint32_t)np560_mp3_hle_tab5_call_count(hle), 1);
     check("P service 0 status", cpu.gpr[2], 0);
     check("P service 0 magic",
