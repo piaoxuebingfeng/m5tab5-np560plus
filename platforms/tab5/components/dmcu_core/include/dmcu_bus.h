@@ -39,6 +39,12 @@ typedef struct Np560Bus {
                         uint32_t start, uint32_t next, bool overlay);
     void *hle_user;
 
+    /* ROM 01/02 每 PC HLE 门（对应 QEMU helper.c:22854 的
+     * cpu->rom_service 调用）。命中时解释器跳过 TRAP#0，直接执行门后
+     * 的 RETS-far。返回 false 则维持原 TRAP/缺 ROM 语义。 */
+    bool (*rom_service)(void *user, DMCUCpu *cpu, uint32_t pc);
+    void *rom_service_user;
+
     /*
      * code 平面（QEMU s->code 独立于 data 总线，np560.c:20993）。为 NULL
      * 时取指回落 phys（旧单平面行为，回归测试兼容）。装载 resident.bin

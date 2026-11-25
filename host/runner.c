@@ -27,6 +27,7 @@
 #include "dmcu_irq.h"
 #include "dmcu_clock.h"
 #include "np560_periph.h"
+#include "np560_mp3_hle_tab5.h"
 
 #define PROGRAM_BASE 0x200000u
 
@@ -1447,6 +1448,54 @@ static void test_o(void)
     np560_bus_destroy(bus);
 }
 
+/* MP3 ROM 门：TRAP#0 必须被 per-PC HLE 拦截，而不是跳进 01:0000 自陷。 */
+static void test_p(void)
+{
+    Np560Bus *bus;
+    DMCUCpu cpu;
+    NP560Mp3HleTab5 *hle;
+    uint8_t *rom;
+    unsigned i, service;
+    const uint16_t marker[8] = {0x0f00, 0xc620, 0x504d, 0x484c,
+                                6, 0, 0, 0};
+
+    printf("[P] MP3 ROM gate per-PC HLE\n");
+    bus = np560_bus_create();
+    rom = (uint8_t *)calloc(0x30000, 1);
+    for (service = 0; service < 6; service++) {
+        for (i = 0; i < 8; i++) {
+            uint16_t word = marker[i];
+            uint32_t at = 0x21e66u + 16u * service + 2u * i;
+            if (i == 5) {
+                word = (uint16_t)service;
+            }
+            rom[at] = (uint8_t)word;
+            rom[at + 1] = (uint8_t)(word >> 8);
+        }
+    }
+    np560_bus_take_code_rom(bus, rom, 0x30000);
+
+    hle = np560_mp3_hle_tab5_create(bus, 0x21e66u);
+    check("P gate marker accepted", hle != NULL, 1);
+    bus->rom_service = np560_mp3_hle_tab5_service;
+    bus->rom_service_user = hle;
+
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.pc = 0x21e66u;
+    cpu.sfr[DMCU_SFR_DS0] = 0xa2u;      /* workspace = 0x510000 (0xa2<<15) */
+    cpu.gpr[3] = 0;
+    dmcu_exec_step(bus, &cpu);
+    /* TRAP 被服务：顺序后继是门内的 RETS-far，没有进入 01:0000 向量。 */
+    check("P gate skips TRAP", cpu.pc, 0x21e68u);
+    check("P gate serviced once", (uint32_t)np560_mp3_hle_tab5_call_count(hle), 1);
+    check("P service 0 status", cpu.gpr[2], 0);
+    check("P service 0 magic",
+          (uint32_t)dmcu_phys_read16(bus, 0x510000u + 20u), 0x4d33u);
+
+    np560_mp3_hle_tab5_destroy(hle);
+    np560_bus_destroy(bus);
+}
+
 int main(void)
 {
     test_a();
@@ -1464,6 +1513,7 @@ int main(void)
     test_m();
     test_n();
     test_o();
+    test_p();
 
     if (failures) {
         printf("FAILED: %d checks\n", failures);

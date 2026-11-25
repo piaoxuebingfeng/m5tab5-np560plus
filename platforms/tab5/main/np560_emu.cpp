@@ -36,6 +36,7 @@
 #include "np560_tab5_keyboard.h"
 #include "np560_tab5_touch.h"
 #include "np560_sd.h"
+#include "np560_mp3_hle_tab5.h"
 
 static const char *TAG = "np560";
 
@@ -65,6 +66,7 @@ static const char *TAG = "np560";
 #define SKIN_PARTITION_NAME "np560skin"
 
 static Np560Bus *s_bus;
+static NP560Mp3HleTab5 *s_mp3_hle;
 static DMCUCpu s_cpu;
 static Np560Periph s_periph;
 static lv_obj_t *s_canvas;
@@ -350,13 +352,14 @@ static void emulator_task(void *arg)
             unsigned ips = (unsigned)(burst_insns / 5);
             ESP_LOGI(TAG,
                      "run: PC=%02x:%04x ips=%u total=%llu "
-                     "irq_pending=%d in_irq=%d unsup=%u",
+                     "irq_pending=%d in_irq=%d unsup=%u mp3hle=%llu",
                      (unsigned)((s_cpu.pc >> 16) & 0xff),
                      (unsigned)(s_cpu.pc & 0xffff), ips,
                      (unsigned long long)total_insns,
                      (int)dmcu_irq_or_dtu_pending(&s_cpu),
                      (int)s_cpu.in_interrupt,
-                     (unsigned)s_cpu.unsupported_count);
+                     (unsigned)s_cpu.unsupported_count,
+                     (unsigned long long)np560_mp3_hle_tab5_call_count(s_mp3_hle));
             last_report = now;
             burst_insns = 0;
             /* NAND 介质统计：确认页编程/擦除不再阻塞 CPU。 */
@@ -523,6 +526,19 @@ void np560_emu_start()
     bool firmware_ok = false;
     if (np560_sd_mount()) {
         firmware_ok = np560_sd_load_firmware(s_bus);
+    }
+    /* QEMU 在每条指令前调用 rom_service 拦截 01/02 ROM 洞里的 MP3 门
+     * (TRAP#0 + "MPLH")。Tab5 解释器原本只覆盖远调用 HLE，进 MP3 会
+     * 在 01:0000 向量无限自陷，触摸/物理按键全部失去响应。 */
+    if (firmware_ok) {
+        s_mp3_hle = np560_mp3_hle_tab5_create(s_bus, 0x21e66u);
+        if (s_mp3_hle) {
+            s_bus->rom_service = np560_mp3_hle_tab5_service;
+            s_bus->rom_service_user = s_mp3_hle;
+            ESP_LOGI(TAG, "MP3 HLE gate ready @0x21e66");
+        } else {
+            ESP_LOGW(TAG, "MP3 HLE gate marker absent; TRAP path unchanged");
+        }
     }
     /* 全屏 canvas(1.76MB) 必须在固件装载之后、NAND attach 之前分配：
      * ① 装载 resident.bin 需要连续 PSRAM，提前占用会让 fread 失败；

@@ -996,11 +996,20 @@ IRAM_ATTR uint32_t dmcu_exec_step(Np560Bus *bus, DMCUCpu *cpu)
         handled = exec_compare_update(bus, cpu, op, arg, ext);
     } else if (op == 0x0f) {
         /* TRAP（helper.c:23096）：同步陷阱，返回点为两字节指令之后的
-         * next，PC 折叠在调用者的 CS 内。 */
-        dmcu_software_trap(bus, cpu,
-                           dmcu_code_address(dmcu_code_segment(start),
-                                             dmcu_code_pc(next)), arg);
-        handled = true;
+         * next，PC 折叠在调用者的 CS 内。
+         * QEMU 在每条指令执行前调用 cpu->rom_service()；重建 ROM 的
+         * MP3 门故意以 TRAP#0 + RETS-far 标记实现。命中时跳过陷阱，
+         * 让下一条 RETS-far 自然返回调用者；否则 01:0000 向量本身也是
+         * 0F00，会无限自陷并冻住整个 guest（MP3 界面按任何键都无响应）。 */
+        if (start >= 0x10000 && start < 0x30000 && bus->rom_service &&
+            bus->rom_service(bus->rom_service_user, cpu, start)) {
+            handled = true;
+        } else {
+            dmcu_software_trap(bus, cpu,
+                               dmcu_code_address(dmcu_code_segment(start),
+                                                 dmcu_code_pc(next)), arg);
+            handled = true;
+        }
     } else if ((op == 0xc0 || op == 0xc1) && exec_mul(cpu, op, arg)) {
         handled = true;
     } else if (op == 0x1f) {

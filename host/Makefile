@@ -3,6 +3,7 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L \
 	-Ishim \
 	-I../platforms/tab5/components/dmcu_core/include \
+	-I../platforms/tab5/components/dmcu_core \
 	-I../platforms/tab5/components/np560_soc/include
 CORE_SRCS = $(wildcard ../platforms/tab5/components/dmcu_core/*.c)
 SOC_SRCS = $(wildcard ../platforms/tab5/components/np560_soc/*.c)

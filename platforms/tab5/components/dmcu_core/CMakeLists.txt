@@ -8,4 +8,6 @@ idf_component_register(SRCS
     "dmcu_irq.c"
     "dmcu_exec.c"
     "dmcu_clock.c"
-    INCLUDE_DIRS "include")
+    "np560_mp3_codec.c"
+    "np560_mp3_hle_tab5.c"
+    INCLUDE_DIRS "include" ".")
